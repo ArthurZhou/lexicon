@@ -136,6 +136,31 @@ impl Db {
         Ok(out)
     }
 
+    /// List due cards restricted to a headword prefix range [start, end).
+    /// Use this to constrain a review session to a section of the wordlist.
+    pub fn due_cards_in_range(
+        &self,
+        now: &chrono::NaiveDateTime,
+        start: &str,
+        end: &str,
+        limit: i64,
+    ) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, w.headword FROM cards c JOIN words w ON w.id = c.word_id
+             WHERE (c.due IS NULL OR c.due <= ?1)
+               AND w.headword >= ?2 AND w.headword < ?3
+             ORDER BY w.headword, c.due IS NULL DESC, c.due ASC LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(params![now.to_string(), start, end, limit], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     /// Load a card for review.
     pub fn load_card(&self, card_id: i64) -> Result<Option<Card>> {
         let mut stmt = self.conn.prepare(
