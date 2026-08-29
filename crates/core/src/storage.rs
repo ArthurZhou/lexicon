@@ -187,6 +187,55 @@ impl Db {
         Ok(card)
     }
 
+    /// Due cards with their definitions, ready for a front-end.
+    pub fn due_card_details(
+        &self,
+        now: &chrono::NaiveDateTime,
+        range: Option<(&str, &str)>,
+        limit: i64,
+    ) -> Result<Vec<(i64, String, String)>> {
+        let sql = match range {
+            Some(_) => {
+                "SELECT c.id, w.headword, e.definition FROM cards c
+                 JOIN words w ON w.id = c.word_id
+                 LEFT JOIN entries e ON e.headword = w.headword
+                 WHERE (c.due IS NULL OR c.due <= ?1)
+                   AND w.headword >= ?2 AND w.headword < ?3
+                 ORDER BY c.due IS NULL DESC, c.due ASC LIMIT ?4"
+            }
+            None => {
+                "SELECT c.id, w.headword, e.definition FROM cards c
+                 JOIN words w ON w.id = c.word_id
+                 LEFT JOIN entries e ON e.headword = w.headword
+                 WHERE (c.due IS NULL OR c.due <= ?1)
+                 ORDER BY c.due IS NULL DESC, c.due ASC LIMIT ?2"
+            }
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let map = |r: &rusqlite::Row| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        };
+        let rows = match range {
+            Some((s, e)) => stmt.query_map(params![now.to_string(), s, e, limit], map)?,
+            None => stmt.query_map(params![now.to_string(), limit], map)?,
+        };
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Apply a grade to a card by id and persist it.
+    pub fn grade_card(&self, card_id: i64, grade: u8) -> Result<()> {
+        if let Some(mut card) = self.load_card(card_id)? {
+            let now = chrono::Local::now().naive_local();
+            crate::sm2::apply_review(&mut card, crate::sm2::Rating::new(grade, now));
+            self.save_card(&card)?;
+        }
+        Ok(())
+    }
+
     /// Persist a reviewed card back to the DB.
     pub fn save_card(&self, card: &Card) -> Result<()> {
         self.conn.execute(
@@ -203,6 +252,7 @@ impl Db {
         )?;
         Ok(())
     }
+
 }
 
 fn parse_status(s: &str) -> ReviewStatus {
