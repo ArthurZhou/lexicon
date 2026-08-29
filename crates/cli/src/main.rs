@@ -61,8 +61,22 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some("review") => {
+            // review <db> [<word>...]  —  add given words as cards then run due loop
+            let db = need(&args, 2, "review <db> [words...]");
+            match review(db, &args[3..]) {
+                Ok(n) => {
+                    println!("review session done, {n} cards processed");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("review failed: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         _ => {
-            eprintln!("usage: lexicon-cli <import|lookup|stats> ...");
+            eprintln!("usage: lexicon-cli <import|lookup|stats|review> ...");
             ExitCode::FAILURE
         }
     }
@@ -95,4 +109,33 @@ fn import(file: &str, db: &str) -> anyhow::Result<usize> {
 fn lookup(db: &str, word: &str) -> anyhow::Result<Option<String>> {
     let d = Db::open(db)?;
     Ok(d.lookup(word)?)
+}
+
+/// Add words as cards, then process the due queue once.
+fn review(db: &str, words: &[String]) -> anyhow::Result<usize> {
+    let d = Db::open(db)?;
+    for w in words {
+        d.add_new_card(w)?;
+    }
+    let now = chrono::Local::now().naive_local();
+    let due = d.due_cards(&now, 100)?;
+    let mut processed = 0usize;
+    for (id, word) in due {
+        // fetch definition to show
+        let def = d.lookup(&word)?.unwrap_or_default();
+        let first_line = strip_html(&def).chars().take(120).collect::<String>();
+        println!("\n=== {word} ===\n{first_line}...");
+        if let Some(mut card) = d.load_card(id)? {
+            // simulate: grade 2 (Good)
+            lexicon_core::sm2::apply_review(&mut card, lexicon_core::sm2::Rating::new(2, now));
+            d.save_card(&card)?;
+            processed += 1;
+        }
+    }
+    Ok(processed)
+}
+
+fn strip_html(s: &str) -> String {
+    let re = regex::Regex::new(r#"<[^>]*>"#).unwrap();
+    re.replace_all(s, " ").to_string()
 }

@@ -7,3 +7,5 @@ license.workspace = true
 [dependencies]
 lexicon-core = { path = "../core" }
 anyhow = "1"
+regex = "1"
+chrono = "0.4"
