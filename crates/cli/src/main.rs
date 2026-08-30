@@ -8,6 +8,8 @@
 //!        --range limits the session to headwords in [start, end).
 //!   scope <db> <wordlist-file>       Add every word in a file as cards.
 
+mod mcp;
+
 use lexicon_core::storage::Db;
 use std::process::ExitCode;
 
@@ -96,13 +98,76 @@ review session done, {n} cards processed");
             // scope <db> <wordlist-file>  —  add every word in a file as cards
             let db = need(&args, 2, "scope <db> <wordlist-file>");
             let file = need(&args, 3, "scope <db> <wordlist-file>");
-            match load_scope(db, file) {
+            match load_scope(db, file, None) {
                 Ok(n) => {
                     println!("scope loaded, {n} cards");
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
                     eprintln!("scope failed: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some("wordlist") => {
+            // wordlist <db> <name> <wordlist-file> [--type word|phrase|pattern]
+            let db = need(&args, 2, "wordlist <db> <name> <wordlist-file> [--type word|phrase|pattern]");
+            let name = need(&args, 3, "wordlist <db> <name> <wordlist-file> [--type word|phrase|pattern]");
+            let file = need(&args, 4, "wordlist <db> <name> <wordlist-file> [--type word|phrase|pattern]");
+            let mut default_type = "word";
+            let mut i = 5;
+            while i < args.len() {
+                if args[i] == "--type" && i + 1 < args.len() {
+                    default_type = args[i + 1].as_str();
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            match import_wordlist(db, name, file, default_type) {
+                Ok(n) => {
+                    println!("wordlist '{name}' ready, {n} cards from {file}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("wordlist failed: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some("phrases") => {
+            // phrases <db> <source-headword>  —  print extracted phrases, or
+            // phrases <db> --extract  —  build the whole phrase bank from entries
+            let db = need(&args, 2, "phrases <db> [--extract | <source-word>]");
+            if args.get(3).map(|s| s.as_str()) == Some("--extract") {
+                match extract_all_phrases(db) {
+                    Ok(n) => {
+                        println!("phrase bank: {n} phrases extracted");
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("extract failed: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            } else {
+                let word = need(&args, 3, "phrases <db> <source-word>");
+                match list_phrases(db, word) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("phrases failed: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+        }
+        Some("config") => {
+            // config <db> --new N --review M   (daily limits)
+            let db = need(&args, 2, "config <db> [--new N] [--review M]");
+            match set_config(db, &args[3..]) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("config failed: {e}");
                     ExitCode::FAILURE
                 }
             }
@@ -128,8 +193,25 @@ review session done, {n} cards processed");
                 }
             }
         }
+        Some("mcp") => {
+            // mcp <db>  —  serve the lexicon as an MCP tool server over stdio.
+            let db = need(&args, 2, "mcp <db>");
+            match Db::open(db) {
+                Ok(d) => match mcp::run(&d) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("mcp failed: {e}");
+                        ExitCode::FAILURE
+                    }
+                },
+                Err(e) => {
+                    eprintln!("open {db} failed: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         _ => {
-            eprintln!("usage: lexicon-cli <import|lookup|stats|review|scope|serve> ...");
+            eprintln!("usage: lexicon-cli <import|lookup|stats|review|scope|wordlist|phrases|config|serve|mcp> ...");
             ExitCode::FAILURE
         }
     }
@@ -231,10 +313,16 @@ fn strip_html(s: &str) -> String {
 }
 
 /// Load a wordlist file, adding each word as a card.
-fn load_scope(db: &str, file: &str) -> anyhow::Result<usize> {
+/// Optionally register the words as a named wordlist for later scoping.
+fn load_scope(db: &str, file: &str, wl_name: Option<&str>) -> anyhow::Result<usize> {
     let d = Db::open(db)?;
+    let wl_id = match wl_name {
+        Some(name) => Some(d.create_wordlist(name)?),
+        None => None,
+    };
     let content = std::fs::read_to_string(file)?;
     let mut n = 0usize;
+    let mut headwords: Vec<String> = Vec::new();
     for line in content.lines() {
         let w = line.trim();
         if w.is_empty() {
@@ -243,8 +331,140 @@ fn load_scope(db: &str, file: &str) -> anyhow::Result<usize> {
         if d.add_new_card(w)? > 0 {
             n += 1;
         }
+        headwords.push(w.to_string());
+    }
+    if let Some(id) = wl_id {
+        d.add_wordlist_words(id, &headwords)?;
     }
     Ok(n)
+}
+
+/// Parse a wordlist file where each line may be:
+///   headword
+///   headword	word|phrase|pattern
+///   word|phrase|pattern:headword[:phrase-text]
+/// and create cards with the right CardType. Skips empty lines and
+/// lines whose headword is not in the imported dictionary.
+fn import_wordlist(db: &str, name: &str, file: &str, default_type: &str) -> anyhow::Result<usize> {
+    use lexicon_core::model::{CardType, Difficulty};
+    let d = Db::open(db)?;
+    let wl_id = d.create_wordlist(name)?;
+    let content = std::fs::read_to_string(file)?;
+    let mut count = 0usize;
+    let mut headwords: Vec<String> = Vec::new();
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Supported line forms:
+        //   headword            -> default type
+        //   headword<TAB>类型    -> explicit type (word|phrase|pattern)
+        //   类型:headword|短语   -> typed card with explicit phrase text
+        let (ctype, rest) = match line.split_once('\t') {
+            Some((h, t)) if ["word", "phrase", "pattern"].contains(&t) => (t.to_string(), h),
+            _ => match line.split_once(':') {
+                Some((t, r)) if ["word", "phrase", "pattern"].contains(&t) => (t.to_string(), r),
+                _ => (default_type.to_string(), line),
+            },
+        };
+        let (head, phrase) = match rest.split_once('|') {
+            Some((h, p)) => (h.trim(), Some(p.trim().to_string())),
+            None => (rest.trim(), None),
+        };
+        let card_type = match ctype.as_str() {
+            "phrase" => CardType::Phrase,
+            "pattern" => CardType::Pattern,
+            _ => CardType::Word,
+        };
+        let id = d.add_new_card_full(
+            head,
+            card_type,
+            Difficulty::Easy,
+            head,
+            phrase.as_deref().unwrap_or(head),
+        )?;
+        if id > 0 {
+            count += 1;
+            headwords.push(head.to_string());
+            if let Some(p) = phrase {
+                headwords.push(p);
+            }
+        }
+    }
+    d.add_wordlist_words(wl_id, &headwords)?;
+    Ok(count)
+}
+
+/// Extract every phrase/idiom from all entries into the phrase bank.
+fn extract_all_phrases(db: &str) -> anyhow::Result<usize> {
+    use lexicon_core::definition::parse_definition;
+    let mut d = Db::open(db)?;
+    d.conn().execute_batch("DELETE FROM phrases")?;
+    let sql = "SELECT headword, definition FROM entries";
+    let mut n = 0usize;
+    d.transaction(|db| {
+        let mut stmt = db.conn().prepare(sql)?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for r in rows {
+            let (head, def) = r?;
+            let parsed = parse_definition(&head, &def);
+            for p in parsed.phrases {
+                db.insert_phrase(&head, &p.kind, &p.text, &p.def_en, &p.def_zh, &p.example_en, &p.example_zh)?;
+                n += 1;
+            }
+        }
+        Ok(n)
+    })?;
+    Ok(n)
+}
+
+/// Print the phrase bank entries for one source headword.
+fn list_phrases(db: &str, word: &str) -> anyhow::Result<()> {
+    let d = Db::open(db)?;
+    let items = d.phrases_for(word)?;
+    if items.is_empty() {
+        println!("no phrases found for '{word}'");
+        return Ok(());
+    }
+    for (_, ptype, text, de, dz, xe, xz) in items {
+        println!("[{ptype}] {text}");
+        if !de.is_empty() {
+            println!("  {de}");
+        }
+        if !dz.is_empty() {
+            println!("  zh: {dz}");
+        }
+        if !xe.is_empty() {
+            println!("  ex: {xe} {xz}");
+        }
+    }
+    Ok(())
+}
+
+/// Set daily limits (or read them when no args).
+fn set_config(db: &str, args: &[String]) -> anyhow::Result<()> {
+    let d = Db::open(db)?;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--new" if i + 1 < args.len() => {
+                d.set_setting("new_per_day", args[i + 1].as_str())?;
+                i += 2;
+            }
+            "--review" if i + 1 < args.len() => {
+                d.set_setting("review_per_day", args[i + 1].as_str())?;
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    let (new_pd, rev_pd) = d.daily_limits()?;
+    let (new_done, rev_done) = d.today_progress()?;
+    println!("daily limits: new {new_done}/{new_pd}, review {rev_done}/{rev_pd}");
+    Ok(())
 }
 
 /// Serve the built-in single-page UI over HTTP.
@@ -333,16 +553,176 @@ fn handle(d: &Db, req: &mut tiny_http::Request) -> tiny_http::Response<std::io::
         (&tiny_http::Method::Get, "/api/due") => {
             let now = chrono::Local::now().naive_local();
             let limit: i64 = query
+                .and_then(|q| q.split('&').next())
                 .and_then(|q| q.split('=').nth(1))
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(100);
-            match d.due_card_details(&now, None, limit) {
-                Ok(cards) => {
+                .unwrap_or(50);
+            let wl: Option<i64> = query
+                .and_then(|q| {
+                    q.split("&").find_map(|kv| {
+                        let (k, v) = kv.split_once("=")?;
+                        (k == "list").then(|| v.parse::<i64>().ok()).flatten()
+                    })
+                })
+                .or_else(|| {
+                    d.get_setting("active_wordlist")
+                        .ok()
+                        .flatten()
+                        .and_then(|v| v.parse::<i64>().ok())
+                });
+            match d.daily_due_queue(&now, limit, wl) {
+                Ok((cards, new_left, review_left)) => {
                     let arr: Vec<serde_json::Value> = cards
                         .into_iter()
-                        .map(|(id, headword, def)| {
-                            let text = resolve_def(&d, &headword, &def);
-                            serde_json::json!({"id": id, "headword": headword, "text": plainify(&text)})
+                        .map(|(id, headword, ctype, diff, phrase)| {
+                            let prompt = build_card_prompt(&d, id, &headword, &ctype, &diff, &phrase);
+                            serde_json::json!({
+                                "id": id,
+                                "headword": headword,
+                                "card_type": ctype,
+                                "difficulty": diff,
+                                "phrase": phrase,
+                                "prompt": prompt,
+                            })
+                        })
+                        .collect();
+                    json_response(
+                        200,
+                        serde_json::json!({
+                            "cards": arr,
+                            "new_left": new_left,
+                            "review_left": review_left,
+                        })
+                        .to_string(),
+                    )
+                }
+                Err(e) => json_response(500, format!("{{\"error\": \"{e}\"}}")),
+            }
+        }
+        (&tiny_http::Method::Get, "/api/settings") => {
+            let (new_pd, rev_pd) = d.daily_limits().unwrap_or((20, 100));
+            let (new_done, rev_done) = d.today_progress().unwrap_or((0, 0));
+            let active = d.get_setting("active_wordlist").unwrap_or_default().and_then(|v| v.parse::<i64>().ok());
+            json_response(
+                200,
+                serde_json::json!({
+                    "new_per_day": new_pd,
+                    "review_per_day": rev_pd,
+                    "new_done": new_done,
+                    "review_done": rev_done,
+                    "active_wordlist": active,
+                })
+                .to_string(),
+            )
+        }
+        (&tiny_http::Method::Post, "/api/settings") => {
+            let body = read_body(req);
+            match serde_json::from_str::<serde_json::Value>(&body) {
+                Ok(v) => {
+                    if let Some(n) = v["new_per_day"].as_u64() {
+                        let _ = d.set_setting("new_per_day", &n.to_string());
+                    }
+                    if let Some(r) = v["review_per_day"].as_u64() {
+                        let _ = d.set_setting("review_per_day", &r.to_string());
+                    }
+                    if let Some(wl) = v["active_wordlist"].as_str() {
+                        let _ = d.set_setting("active_wordlist", wl);
+                    }
+                    json_response(200, "{\"ok\":true}".into())
+                }
+                Err(e) => json_response(400, format!("{{\"ok\":false,\"error\":\"{e}\"}}")),
+            }
+        }
+        (&tiny_http::Method::Get, "/api/wordlists") => {
+            match d.wordlists() {
+                Ok(lists) => {
+                    let arr: Vec<serde_json::Value> = lists
+                        .iter()
+                        .map(|w| serde_json::json!({"id": w.id, "name": w.name, "size": w.size}))
+                        .collect();
+                    json_response(200, serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into()))
+                }
+                Err(e) => json_response(500, format!("{{\"error\": \"{e}\"}}")),
+            }
+        }
+        (&tiny_http::Method::Get, "/api/cards") => {
+            let limit: i64 = query
+                .and_then(|q| q.split('&').next())
+                .and_then(|q| q.split('=').nth(1))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(200);
+            match d.card_records(limit) {
+                Ok(rows) => {
+                    let arr: Vec<serde_json::Value> = rows
+                        .into_iter()
+                        .map(|(id, headword, ctype, diff, status, reps, lapses, due, last, _created)| {
+                            serde_json::json!({
+                                "id": id,
+                                "headword": headword,
+                                "card_type": ctype,
+                                "difficulty": diff,
+                                "status": status,
+                                "reps": reps,
+                                "lapses": lapses,
+                                "due": due,
+                                "last_review": last,
+                            })
+                        })
+                        .collect();
+                    json_response(200, serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into()))
+                }
+                Err(e) => json_response(500, format!("{{\"error\": \"{e}\"}}")),
+            }
+        }
+        (&tiny_http::Method::Post, "/api/random") => {
+            match d.random_word() {
+                Ok(Some(w)) => {
+                    match d.add_new_card(&w) {
+                        Ok(id) if id > 0 => {
+                            json_response(200, format!("{{\"ok\":true,\"word\":\"{w}\",\"id\":{id}}}"))
+                        }
+                        _ => json_response(200, "{\"ok\":false}".into()),
+                    }
+                }
+                _ => json_response(200, "{\"ok\":false}".into()),
+            }
+        }
+        (&tiny_http::Method::Get, "/api/phrase_count") => {
+            let n = d.phrase_count().unwrap_or(0);
+            json_response(200, format!("{{\"count\":{n}}}"))
+        }
+        (&tiny_http::Method::Post, "/api/card/difficulty") => {
+            let body = read_body(req);
+            match serde_json::from_str::<serde_json::Value>(&body) {
+                Ok(v) => {
+                    let id = v["id"].as_i64().unwrap_or(0);
+                    let diff = match v["difficulty"].as_str().unwrap_or("easy") {
+                        "hard" => lexicon_core::model::Difficulty::Hard,
+                        _ => lexicon_core::model::Difficulty::Easy,
+                    };
+                    match d.set_card_difficulty(id, diff) {
+                        Ok(()) => json_response(200, "{\"ok\":true}".into()),
+                        Err(e) => json_response(200, format!("{{\"ok\":false,\"error\":\"{e}\"}}")),
+                    }
+                }
+                Err(e) => json_response(400, format!("{{\"ok\":false,\"error\":\"{e}\"}}")),
+            }
+        }
+        (&tiny_http::Method::Get, "/api/card/history") => {
+            let id: i64 = query
+                .and_then(|q| q.split('=').nth(1))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            match d.card_history(id) {
+                Ok(log) => {
+                    let arr: Vec<serde_json::Value> = log
+                        .iter()
+                        .map(|l| {
+                            serde_json::json!({
+                                "at": l.reviewed_at.format("%m-%d %H:%M").to_string(),
+                                "grade": l.grade,
+                                "is_new": l.is_new,
+                            })
                         })
                         .collect();
                     json_response(200, serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into()))
@@ -486,6 +866,162 @@ fn resolve_def(d: &Db, headword: &str, def: &str) -> String {
     }
 }
 
+/// Build the review prompt for one card according to its study mode:
+///  - word (difficulty easy): the example sentence + its Chinese
+///    translation as a hint; the answer is the headword.
+///  - word (difficulty hard): first letter + a few Chinese senses.
+///  - phrase: the Chinese gloss + Chinese example; answer is the phrase.
+///  - pattern: the usage note (Chinese) + example; answer is the pattern.
+/// Returns a JSON object: {kind, question, hint, answer, extra}.
+/// Normalize a phrase text for matching: drop stress/separator glyphs
+/// (ˈ ˌ ↔ | / ) and trim, so "give sb a ˈbreak" matches "give sb a break".
+fn norm_phrase(s: &str) -> String {
+    s.chars()
+        .filter(|c| !matches!(c, '\u{02C8}' | '\u{02CC}' | '\u{2194}' | '\u{007C}' | '\u{002F}'))
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+pub(crate) fn build_card_prompt(
+    d: &Db,
+    _card_id: i64,
+    headword: &str,
+    ctype: &str,
+    diff: &str,
+    phrase: &str,
+) -> serde_json::Value {
+    use lexicon_core::definition::parse_definition;
+
+    let def = d.lookup_resolved(headword).ok().flatten().unwrap_or_default();
+    let parsed = parse_definition(headword, &def);
+
+    match ctype {
+        "phrase" => {
+            // Fixed phrase / collocation: prefer the phrase bank (already
+            // extracted, deduped) so the gloss matches THIS phrase, falling
+            // back to whatever the headword definition parses.
+            let (zh, ex_en, ex_zh) = d
+                .phrases_for(headword)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|(_, _pt, text, _de, _dz, _xe, _xz)| norm_phrase(text) == norm_phrase(phrase))
+                .map(|(_, _pt, _text, de, dz, xe, xz)| {
+                    let z = if dz.is_empty() { de.clone() } else { dz.clone() };
+                    (z, xe.clone(), xz.clone())
+                })
+                .or_else(|| {
+                    parsed.phrases.iter().find(|p| p.text.contains(phrase)).map(|p| (
+                        if p.def_zh.is_empty() { p.def_en.clone() } else { p.def_zh.clone() },
+                        p.example_en.clone(),
+                        p.example_zh.clone(),
+                    ))
+                })
+                .unwrap_or_default();
+            let question = if !zh.is_empty() { zh } else { plainify(&def).chars().take(60).collect() };
+            let hint = if !ex_en.is_empty() { format!("{ex_en}\n{ex_zh}") } else { String::new() };
+            serde_json::json!({
+                "kind": "phrase",
+                "question": question,
+                "hint": hint,
+                "answer": phrase,
+                "extra": {
+                    "pos": parsed.pos,
+                    "phonetic": parsed.phonetic,
+                    "source": headword,
+                    "example": ex_en,
+                    "example_zh": ex_zh,
+                }
+            })
+        }
+        "pattern" => {
+            // Sentence pattern / special usage: also prefer the phrase bank
+            // (idioms/sayings carry the usage gloss); else first id/sd block.
+            let (zh, ex_en, ex_zh) = d
+                .phrases_for(headword)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|(_, pt, text, _de, _dz, _xe, _xz)| {
+                    (pt == "id" || pt == "sd") && norm_phrase(text) == norm_phrase(phrase)
+                })
+                .map(|(_, _pt, _text, de, dz, xe, xz)| {
+                    let z = if dz.is_empty() { de.clone() } else { dz.clone() };
+                    (z, xe.clone(), xz.clone())
+                })
+                .or_else(|| {
+                    parsed.phrases.iter().find(|p| p.kind == "id" || p.kind == "sd").map(|p| (
+                        if p.def_zh.is_empty() { p.def_en.clone() } else { p.def_zh.clone() },
+                        p.example_en.clone(),
+                        p.example_zh.clone(),
+                    ))
+                })
+                .unwrap_or_default();
+            let question = if !zh.is_empty() { zh } else { plainify(&def).chars().take(60).collect() };
+            serde_json::json!({
+                "kind": "pattern",
+                "question": question,
+                "hint": ex_zh,
+                "answer": phrase,
+                "extra": {
+                    "source": headword,
+                    "example": ex_en,
+                    "example_zh": ex_zh,
+                }
+            })
+        }
+        _ => {
+            // Word: Chinese->English. Easy = example + Chinese hint;
+            // hard = initial letter + a couple of Chinese senses.
+            let zh = if parsed.senses_zh.is_empty() {
+                plainify(&def).chars().take(60).collect::<String>()
+            } else {
+                parsed.senses_zh[..parsed.senses_zh.len().min(2)].join("；")
+            };
+            let (ex_en, ex_zh) = parsed
+                .examples
+                .first()
+                .map(|(e, z)| (e.clone(), z.clone()))
+                .unwrap_or_default();
+            let hard_example = format!("{ex_en}
+{ex_zh}");
+            let (question, hint) = if diff == "hard" {
+                // Hard: first letter mask + Chinese senses.
+                let initial = headword
+                    .chars()
+                    .take(1)
+                    .collect::<String>()
+                    .to_uppercase();
+                (
+                    format!("{initial}___  {zh}"),
+                    String::new(),
+                )
+            } else {
+                // Easy: example sentence + Chinese as the hint.
+                (
+                    if zh.is_empty() { ex_en.clone() } else { zh },
+                    hard_example,
+                )
+            };
+            serde_json::json!({
+                "kind": "word",
+                "question": question,
+                "hint": hint,
+                "answer": headword,
+                "extra": {
+                    "pos": parsed.pos,
+                    "phonetic": parsed.phonetic,
+                    "senses_zh": parsed.senses_zh,
+                    "example": ex_en,
+                    "example_zh": ex_zh,
+                    "difficulty": diff,
+                }
+            })
+        }
+    }
+}
+
 /// Convert an MDX definition (HTML with markup, styles and media links)
 /// into readable plain text. This is what kills the "raw source code" look:
 /// scripts, styles, images, audio and sound:// refs are dropped, block
@@ -611,12 +1147,11 @@ const INDEX_HTML: &str = r####"<!doctype html>
 <meta name="apple-mobile-web-app-title" content="Lexicon">
 <link rel="manifest" href="/manifest.json">
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
-<link rel="apple-touch-icon" href="/icon.svg">
-<title>Lexicon</title>
+<title>Lexicon 词典 · 背单词</title>
 <style>
   :root {
-    --bg: #f8fafc; --card: #ffffff; --ink: #0f172a; --muted: #64748b;
-    --brand: #2563eb; --brand-ink: #ffffff;
+    --bg: #f1f5f9; --card: #ffffff; --ink: #0f172a; --muted: #64748b;
+    --brand: #2563eb; --brand-ink: #ffffff; --line: #e2e8f0;
     --again: #dc2626; --hard: #f59e0b; --good: #16a34a; --easy: #0891b2;
     --safe-b: env(safe-area-inset-bottom, 0px); --safe-t: env(safe-area-inset-top, 0px);
   }
@@ -630,82 +1165,129 @@ const INDEX_HTML: &str = r####"<!doctype html>
   #app { display: flex; flex-direction: column; height: 100%; }
   header {
     background: linear-gradient(135deg, #1d4ed8, #2563eb, #3b82f6);
-    color: #fff; padding: calc(14px + var(--safe-t)) 18px 30px 18px;
-    display: flex; align-items: baseline; justify-content: space-between;
+    color: #fff; padding: calc(12px + var(--safe-t)) 16px 26px 16px;
   }
-  header h1 { margin: 0; font-size: 1.35rem; font-weight: 800; letter-spacing: 0.02em; }
-  header .stat { font-size: 0.85rem; opacity: 0.92; font-weight: 600; }
-  main { flex: 1; overflow-y: auto; padding: 0 14px 90px; }
-  .card {
-    background: var(--card); border-radius: 16px;
-    box-shadow: 0 1px 3px rgba(15,23,42,.08), 0 6px 18px rgba(15,23,42,.06);
-    margin: -14px auto 14px; max-width: 640px; overflow: hidden;
-    border: 1px solid #e2e8f0;
+  header .toprow { display: flex; align-items: center; justify-content: space-between; }
+  header h1 { margin: 0; font-size: 1.3rem; font-weight: 800; }
+  header .progress { margin-top: 10px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  header .pill {
+    background: rgba(255,255,255,.16); border-radius: 10px; padding: 8px 12px;
+    font-size: .82rem; font-weight: 600; display: flex; align-items: center; gap: 8px;
   }
-  .headword {
-    padding: 20px 20px 10px; font-size: 1.9rem; font-weight: 800; color: var(--ink);
-    line-height: 1.15; word-break: break-word;
+  header .pill b { font-size: 1.05rem; }
+  header .mini { font-size: .72rem; opacity: .85; margin-left: auto; }
+  main { flex: 1; overflow-y: auto; padding: 0 14px calc(86px + var(--safe-b)); }
+  .cardbox {
+    background: var(--card); border-radius: 18px; margin: 12px auto; max-width: 640px;
+    box-shadow: 0 1px 3px rgba(15,23,42,.08), 0 10px 30px rgba(15,23,42,.08);
+    border: 1px solid var(--line); overflow: hidden;
   }
+  .tag { display: inline-block; font-size: .72rem; font-weight: 700; padding: 3px 10px; border-radius: 999px; letter-spacing: .04em; }
+  .tag.word { background: #dbeafe; color: #1d4ed8; }
+  .tag.phrase { background: #dcfce7; color: #15803d; }
+  .tag.pattern { background: #fef3c7; color: #b45309; }
+  .tag.diff-hard { background: #fee2e2; color: #b91c1c; }
+  .tag.diff-easy { background: #e0f2fe; color: #0369a1; }
+  .prompt {
+    padding: 22px 20px 14px; font-size: 1.35rem; font-weight: 700; line-height: 1.5;
+    word-break: break-word; min-height: 96px;
+  }
+  .hint { padding: 0 20px 8px; color: var(--muted); font-size: .95rem; line-height: 1.6; word-break: break-word; }
+  .answer-box { padding: 10px 20px 18px; display: none; }
+  .answer-box .aw {
+    background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 12px;
+    padding: 14px 16px; font-size: 1.5rem; font-weight: 800; color: #14532d;
+    word-break: break-word; text-align: center;
+  }
+  .answer-box .meta { margin-top: 10px; font-size: .9rem; color: #334155; line-height: 1.7; white-space: pre-wrap; word-break: break-word; }
+  .button-row { padding: 0 20px 18px; display: flex; gap: 10px; }
+  button {
+    border: 0; border-radius: 12px; font-weight: 700; cursor: pointer;
+    touch-action: manipulation; font-size: .98rem; color: #fff;
+  }
+  .btn {
+    flex: 1; padding: 15px 8px; font-size: 1.02rem; font-weight: 800;
+  }
+  .btn.again { background: var(--again); }
+  .btn.hard { background: var(--hard); }
+  .btn.good { background: var(--good); }
+  .btn.easy { background: var(--easy); }
   .reveal {
-    margin: 4px 20px 20px; padding: 14px; width: calc(100% - 40px);
-    border: 0; border-radius: 12px; background: var(--brand); color: var(--brand-ink);
-    font-size: 1.05rem; font-weight: 700; cursor: pointer; touch-action: manipulation;
+    width: 100%; display: block; margin: 0; padding: 16px;
+    background: var(--brand); color: var(--brand-ink); font-size: 1.05rem; border-radius: 0;
   }
-  .def {
-    padding: 0 20px 16px; color: #1e293b; font-size: 1rem; line-height: 1.7;
-    white-space: pre-wrap; word-break: break-word; max-height: 45vh; overflow-y: auto;
+  .toolbar { display: flex; gap: 8px; padding: 12px 14px; align-items: center; flex-wrap: wrap; }
+  .toolbar select, .toolbar input[type=number] {
+    border: 1px solid var(--line); border-radius: 10px; padding: 9px 10px; font-size: .9rem; background: #fff; color: var(--ink);
   }
-  .grades { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 8px; padding: 0 20px 20px; }
-  .grades button {
-    border: 0; border-radius: 12px; padding: 14px 4px; font-size: 0.98rem; font-weight: 800;
-    color: #fff; cursor: pointer; touch-action: manipulation; min-height: 52px;
+  .toolbar label { font-size: .82rem; color: var(--muted); font-weight: 600; }
+  .ghost {
+    background: #eef2ff; color: #3730a3; border: 1px solid #c7d2fe;
+    padding: 9px 14px; border-radius: 10px; font-size: .86rem; font-weight: 700;
   }
-  .g-again { background: var(--again); } .g-hard { background: var(--hard); }
-  .g-good { background: var(--good); } .g-easy { background: var(--easy); }
-  .empty { padding: 48px 24px; text-align: center; color: var(--muted); font-size: 1rem; }
-  .empty .big { font-size: 2.2rem; margin-bottom: 8px; }
-  .searchbox { display: flex; gap: 8px; padding: 14px; }
+  .ghost.warn { background: #fef2f2; color: #991b1b; border-color: #fecaca; }
+  .section-title { font-size: .8rem; font-weight: 800; color: var(--muted); letter-spacing: .1em; margin: 18px 6px 8px; }
+  .look-row {
+    background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px;
+    margin-bottom: 8px; display: flex; align-items: center; gap: 10px; cursor: pointer;
+  }
+  .look-row .hw { font-weight: 700; font-size: 1.02rem; flex: 1; word-break: break-word; }
+  .look-row .add { background: var(--brand); color: #fff; border: 0; border-radius: 8px; padding: 8px 12px; font-size: .8rem; font-weight: 700; cursor: pointer; }
+  .searchbox { display: flex; gap: 8px; padding: 4px 0 14px; }
   .searchbox input {
-    flex: 1; border: 1px solid #cbd5e1; border-radius: 12px; padding: 12px 14px;
-    font-size: 1.05rem; background: #fff; color: var(--ink); outline: none;
+    flex: 1; border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px;
+    font-size: 1rem; background: #fff;
   }
-  .searchbox input:focus { border-color: var(--brand); box-shadow: 0 0 0 3px rgba(37,99,235,.15); }
-  .results { list-style: none; margin: 0; padding: 0 14px; }
-  .results li {
-    background: #fff; border: 1px solid #e2e8f0; border-radius: 12px;
-    padding: 14px 16px; margin-bottom: 10px; cursor: pointer;
+  .setting-row {
+    background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px;
+    margin-bottom: 10px; display: flex; align-items: center; gap: 12px;
   }
-  .results li b { font-size: 1.15rem; display: block; margin-bottom: 4px; }
-  .results li p { margin: 0; color: var(--muted); font-size: 0.9rem; line-height: 1.5;
-    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-  .detail { background: #fff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 16px; margin: 0 14px 14px; }
-  .detail h2 { margin: 0 0 8px; font-size: 1.5rem; }
-  .detail .def { padding: 0; max-height: 40vh; }
-  .addbtn {
-    width: 100%; border: 0; border-radius: 12px; padding: 14px; margin-top: 12px;
-    background: var(--brand); color: var(--brand-ink); font-size: 1.05rem; font-weight: 700; cursor: pointer;
+  .setting-row .lbl { flex: 1; font-weight: 600; font-size: .92rem; }
+  .setting-row .sub { color: var(--muted); font-size: .78rem; margin-top: 2px; }
+  .toggle { position: relative; width: 46px; height: 26px; flex-shrink: 0; }
+  .toggle input { opacity: 0; width: 0; height: 0; }
+  .toggle .slider {
+    position: absolute; inset: 0; background: #cbd5e1; border-radius: 999px; transition: .2s;
   }
-  .prog {
-    padding: 10px 20px 0; font-size: 0.85rem; color: var(--brand); font-weight: 700;
+  .toggle .slider::before {
+    content: ""; position: absolute; width: 20px; height: 20px; border-radius: 50%;
+    background: #fff; top: 3px; left: 3px; transition: .2s;
   }
+  .toggle input:checked + .slider { background: var(--brand); }
+  .toggle input:checked + .slider::before { transform: translateX(20px); }
+  .empty { text-align: center; color: var(--muted); padding: 40px 20px; font-size: .95rem; }
+  .empty .big { font-size: 2.2rem; margin-bottom: 10px; }
   nav {
-    position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
-    background: rgba(255,255,255,.92); backdrop-filter: blur(12px);
-    border-top: 1px solid #e2e8f0; display: flex; padding-bottom: var(--safe-b);
+    position: fixed; bottom: 0; left: 0; right: 0; z-index: 20;
+    background: rgba(255,255,255,.96); backdrop-filter: blur(10px);
+    border-top: 1px solid var(--line);
+    display: grid; grid-template-columns: 1fr 1fr 1fr; padding-bottom: var(--safe-b);
   }
   nav button {
-    flex: 1; border: 0; background: none; padding: 12px 0; font-size: 0.95rem; font-weight: 700;
-    color: var(--muted); cursor: pointer; position: relative;
+    background: none; color: var(--muted); padding: 10px 4px 8px;
+    display: flex; flex-direction: column; align-items: center; gap: 3px;
+    font-size: .68rem; font-weight: 700;
   }
-  nav button.active { color: var(--brand); }
-  nav button.active::after {
-    content: ""; position: absolute; left: 50%; transform: translateX(-50%); bottom: 4px;
-    width: 32px; height: 3px; border-radius: 2px; background: var(--brand);
+  nav button .ico { font-size: 1.3rem; }
+  nav button.on { color: var(--brand); }
+  .row { display: flex; align-items: center; gap: 10px; }
+  .stat-line { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin: 10px 0; }
+  .stat-cell { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 10px; text-align: center; }
+  .stat-cell .n { font-size: 1.2rem; font-weight: 800; }
+  .stat-cell .t { font-size: .72rem; color: var(--muted); font-weight: 600; margin-top: 2px; }
+  .rec-row {
+    background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px;
+    margin-bottom: 8px;
   }
+  .rec-row .top { display: flex; align-items: center; gap: 8px; }
+  .rec-row .hw { font-weight: 700; flex: 1; word-break: break-word; }
+  .rec-row .sub { font-size: .78rem; color: var(--muted); margin-top: 6px; line-height: 1.6; }
+  .thin-progress { height: 6px; background: #e2e8f0; border-radius: 999px; overflow: hidden; margin-top: 8px; }
+  .thin-progress .fill { height: 100%; background: var(--brand); border-radius: 999px; transition: width .4s; }
   .toast {
-    position: fixed; left: 50%; bottom: calc(76px + var(--safe-b)); transform: translateX(-50%);
-    background: #0f172a; color: #fff; padding: 10px 18px; border-radius: 10px;
-    font-size: 0.9rem; opacity: 0; pointer-events: none; transition: opacity .25s; z-index: 99;
+    position: fixed; left: 50%; bottom: calc(90px + var(--safe-b)); transform: translateX(-50%);
+    background: #0f172a; color: #fff; padding: 10px 18px; border-radius: 999px;
+    font-size: .85rem; opacity: 0; transition: opacity .25s; pointer-events: none; z-index: 50;
   }
   .toast.show { opacity: .95; }
 </style>
@@ -713,218 +1295,320 @@ const INDEX_HTML: &str = r####"<!doctype html>
 <body>
 <div id="app">
   <header>
-    <h1>Lexicon</h1>
-    <span class="stat" id="stat">…</span>
+    <div class="toprow"><h1>Lexicon</h1><span class="mini" id="hdrList">全部词库</span></div>
+    <div class="progress">
+      <div class="pill">🆕 新学 <b id="pNew">0</b><span class="mini" id="pNewLim">/20</span></div>
+      <div class="pill">🔁 复习 <b id="pRev">0</b><span class="mini" id="pRevLim">/100</span></div>
+    </div>
   </header>
   <main id="main"></main>
   <nav>
-    <button id="tab-review" class="active">复习</button>
-    <button id="tab-lookup">查词</button>
+    <button id="tabStudy" class="on"><span class="ico">🎴</span>学习</button>
+    <button id="tabLook"><span class="ico">🔎</span>查词</button>
+    <button id="tabStats"><span class="ico">📊</span>记录</button>
   </nav>
   <div class="toast" id="toast"></div>
 </div>
 <script>
-(function () {
-  var main = document.getElementById('main');
-  var toast = document.getElementById('toast');
-  var statEl = document.getElementById('stat');
-  var current = null;  // card under review: {id, headword, text}
-  var revealed = false;
+"use strict";
+var state = { tab: "study", queue: [], idx: 0, settings: null, lists: [], activeList: 0, typing: "" };
 
-  function showToast(msg) {
-    toast.textContent = msg;
-    toast.classList.add('show');
-    clearTimeout(showToast._t);
-    showToast._t = setTimeout(function () { toast.classList.remove('show'); }, 1800);
-  }
-  function el(tag, cls, text) {
-    var d = document.createElement(tag);
-    if (cls) d.className = cls;
-    if (text !== undefined) d.textContent = text;
-    return d;
-  }
+function $(id) { return document.getElementById(id); }
+function esc(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
+function toast(msg) { var t = $("toast"); t.textContent = msg; t.classList.add("show"); setTimeout(function () { t.classList.remove("show"); }, 1600); }
+function post(url, data, cb) {
+  fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) })
+    .then(function (r) { return r.json(); })
+    .then(function (j) { cb && cb(j); })
+    .catch(function () { toast("网络错误"); });
+}
 
-  /* ---------- stats ---------- */
-  function refreshStat() {
-    fetch('/api/stats').then(function (r) { return r.json(); }).then(function (s) {
-      statEl.textContent = '待复习 ' + (s.due || 0) + ' · ' + (s.cards || 0) + ' 卡';
-    }).catch(function () { statEl.textContent = '复习中'; });
-  }
+function tagHtml(ctype, diff) {
+  var c = ctype || "word";
+  var d = diff || "easy";
+  return '<span class="tag ' + esc(c) + '">' + (c === "word" ? "单词" : c === "phrase" ? "词组" : "句式") + '</span> ' +
+         '<span class="tag diff-' + esc(d) + '">' + (d === "hard" ? "困难" : "简单") + '</span>';
+}
 
-  /* ---------- review flow ---------- */
-  function loadReview() {
-    fetch('/api/due?limit=1').then(function (r) { return r.json(); }).then(function (cards) {
-      refreshStat();
-      if (!cards.length) {
-        main.innerHTML = '';
-        var card = el('div', 'card');
-        var e = el('div', 'empty');
-        var big = el('div', 'big'); big.textContent = '🎉';
-        e.appendChild(big);
-        e.appendChild(document.createTextNode('暂无到期卡片'));
-        card.appendChild(e);
-        var again = el('button', 'reveal', '抽一张生词看看');
-        again.onclick = addRandom;
-        card.appendChild(again);
-        main.appendChild(card);
-        current = null; revealed = false;
-        return;
-      }
-      current = cards[0]; revealed = false;
-      renderCard();
-    }).catch(function () { main.innerHTML = '<div class="empty">无法连接服务</div>'; });
-  }
+// ---- header progress ----
+function refreshHeader() {
+  fetch("/api/settings").then(function (r) { return r.json(); }).then(function (s) {
+    state.settings = s;
+    $("pNew").textContent = s.new_done; $("pNewLim").textContent = "/" + s.new_per_day;
+    $("pRev").textContent = s.review_done; $("pRevLim").textContent = "/" + s.review_per_day;
+  }).catch(function () {});
+  fetch("/api/wordlists").then(function (r) { return r.json(); }).then(function (ls) {
+    state.lists = ls;
+    if (ls.length === 0) { $("hdrList").textContent = "全部词库"; return; }
+    var cur = null;
+    ls.forEach(function (l) { if (l.id === state.activeList) cur = l; });
+    $("hdrList").textContent = cur ? cur.name : "全部词库";
+  }).catch(function () {});
+}
 
-  function renderCard() {
-    main.innerHTML = '';
-    var card = el('div', 'card');
-    var prog = el('div', 'prog');
-    prog.textContent = '点击下方按钮显示释义';
-    card.appendChild(prog);
-    var hw = el('div', 'headword'); hw.textContent = current.headword;
-    card.appendChild(hw);
-    if (revealed) {
-      var def = el('div', 'def');
-      def.textContent = (current.text && current.text.trim()) ? current.text : '（词典中未找到释义）';
-      card.appendChild(def);
-      var grades = el('div', 'grades');
-      var opts = [['再认一次', 0, 'g-again'], ['困难', 1, 'g-hard'], ['认识', 2, 'g-good'], ['简单', 3, 'g-easy']];
-      opts.forEach(function (o) {
-        var b = el('button', o[2], o[0]);
-        b.onclick = function () { grade(o[1]); };
-        grades.appendChild(b);
-      });
-      card.appendChild(grades);
-    } else {
-      var b = el('button', 'reveal', '显示释义');
-      b.onclick = function () { revealed = true; renderCard(); };
-      card.appendChild(b);
-    }
-    main.appendChild(card);
-  }
+// ---- study tab ----
+function loadQueue() {
+  var url = "/api/due?limit=60";
+  if (state.activeList > 0) url = url + "&list=" + state.activeList;
+  fetch(url).then(function (r) { return r.json(); }).then(function (j) {
+    state.queue = j.cards || [];
+    state.idx = 0;
+    if (state.queue.length === 0) renderStudyEmpty();
+    else renderCard();
+    refreshHeader();
+  }).catch(function () { renderStudyEmpty(); });
+}
 
-  function grade(g) {
-    if (!current) return;
-    var id = current.id;
-    fetch('/api/grade', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: id, grade: g })
-    }).then(function (r) { return r.json(); }).then(function (d) {
-      loadReview();
-      main.scrollTop = 0;
-    }).catch(loadReview);
-  }
+function renderStudyEmpty() {
+  var main = $("main");
+  main.innerHTML =
+    '<div class="cardbox"><div class="empty"><div class="big">🎉</div>' +
+    '今天的任务完成啦！<br><br>' +
+    '<span class="ghost" onclick="addRandom()">抽一张生词看看</span></div></div>' +
+    '<div class="cardbox" style="padding:14px 16px">' +
+    '<div class="section-title">复习设置</div>\
+    <div class="setting-row"><div class="lbl">每日新学词数<div class="sub">每天最多新认识的单词（含词组/句式）</div></div>' +
+    '<input type="number" min="1" max="200" value="' + (state.settings ? state.settings.new_per_day : 20) + '" id="inNew" style="width:70px">' +
+    '</div>' +
+    '<div class="setting-row"><div class="lbl">每日复习上限<div class="sub">每天处理到期卡片的上限</div></div>' +
+    '<input type="number" min="5" max="1000" value="' + (state.settings ? state.settings.review_per_day : 100) + '" id="inRev" style="width:70px">' +
+    '</div>' +
+    '<button class="reveal" onclick="saveLimits()">保存设定</button>' +
+    '<div class="section-title">所在词表</div>' +
+    wordlistSelector() +
+    '</div>';
+}
 
-  /* ---------- add a random unseen word (when nothing is due) ---------- */
-  function addRandom() {
-    fetch('/api/stats').then(function (r) { return r.json(); }).then(function (s) {
-      if (!s.words) { showToast('词库为空'); return; }
-      var letters = 'abcdefghijklmnopqrstuvwxyz';
-      var l = letters.charAt(Math.floor(Math.random() * letters.length));
-      return fetch('/api/search?q=' + l).then(function (r) { return r.json(); }).then(function (list) {
-        if (!list.length) { showToast('没有可添加的词'); return; }
-        var item = list[Math.floor(Math.random() * list.length)];
-        return fetch('/api/add', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ word: item.headword })
-        }).then(function () {
-          showToast('已加入: ' + item.headword);
-          loadReview();
-        });
-      });
-    }).catch(function () { showToast('操作失败'); });
-  }
+function wordlistSelector() {
+  var opts = '<option value="0">全部词表</option>';
+  (state.lists || []).forEach(function (l) {
+    opts += '<option value="' + l.id + '" ' + (l.id === state.activeList ? "selected" : "") + '>' + esc(l.name) + "（" + l.size + "词）</option>";
+  });
+  return '<div class="toolbar"><select id="selList" onchange="changeList(this.value)">' + opts + "</select></div>";
+}
 
-  /* ---------- lookup tab ---------- */
-  var input, results, detail;
-  function buildLookup() {
-    main.innerHTML = '';
-    var box = el('div', 'searchbox');
-    input = el('input');
-    input.type = 'search'; input.placeholder = '输入单词或前缀，如 apple';
-    box.appendChild(input);
-    results = el('ul', 'results');
-    detail = el('div', 'detail');
-    detail.style.display = 'none';
-    main.appendChild(box); main.appendChild(results); main.appendChild(detail);
-    var t = null;
-    input.addEventListener('input', function () {
-      clearTimeout(t);
-      var q = input.value.trim();
-      if (!q) { results.innerHTML = ''; return; }
-      t = setTimeout(function () { doSearch(q); }, 200);
+function changeList(v) {
+  state.activeList = parseInt(v, 10) || 0;
+  loadQueue();
+}
+
+function saveLimits() {
+  var n = parseInt($("inNew").value, 10) || 20;
+  var r = parseInt($("inRev").value, 10) || 100;
+  post("/api/settings", { new_per_day: n, review_per_day: r }, function (j) {
+    toast(j.ok ? "已保存" : "保存失败");
+    refreshHeader();
+  });
+}
+
+function addRandom() {
+  post("/api/random", {}, function (j) { if (j && j.ok) { toast("已加入: " + j.word); loadQueue(); } });
+}
+
+function renderCard() {
+  var c = state.queue[state.idx];
+  if (!c) { renderStudyEmpty(); return; }
+  var p = c.prompt || {};
+  var main = $("main");
+  var meta = p.extra || {};
+  var metaHtml = "";
+  if (meta.phonetic) metaHtml += esc(meta.phonetic) + " ";
+  if (meta.pos) metaHtml += "(" + esc(meta.pos) + ") ";
+  if (meta.senses_zh && meta.senses_zh.length) metaHtml += "\n" + esc(meta.senses_zh.join("；"));
+  if (meta.example) metaHtml += "\n例: " + esc(meta.example) + (meta.example_zh ? " " + esc(meta.example_zh) : "");
+  if (meta.source && meta.source !== c.headword) metaHtml += "\n源自: " + esc(meta.source);
+
+  main.innerHTML =
+    '<div class="cardbox">' +
+    '<div class="toolbar">' + tagHtml(c.card_type, c.difficulty) +
+    '<span class="ghost" onclick="flipDiff(' + c.id + ')">切换难度</span>' +
+    '<span class="ghost warn" onclick="showHistory(' + c.id + ')">📜 记录</span></div>' +
+    '<div class="prompt">' + esc(p.question || c.headword) + '</div>' +
+    '<div class="hint">' + (p.hint ? "💡 " + esc(p.hint) : "") + '</div>' +
+    '<div id="ansBox" class="answer-box">' +
+      '<div class="aw">' + esc(p.answer || c.headword) + '</div>' +
+      '<div class="meta">' + metaHtml + '</div>' +
+    '</div>' +
+    '<button class="reveal" id="btnReveal" onclick="reveal(' + c.id + ')">显示答案</button>' +
+    '<div class="button-row" id="gradeRow" style="display:none">' +
+      '<button class="btn again" onclick="grade(' + c.id + ',0)">😵 忘记</button>' +
+      '<button class="btn hard" onclick="grade(' + c.id + ',1)">🤔 困难</button>' +
+      '<button class="btn good" onclick="grade(' + c.id + ',2)">😊 认识</button>' +
+      '<button class="btn easy" onclick="grade(' + c.id + ',3)">😎 简单</button>' +
+    '</div></div>' +
+    '<div class="cardbox" style="padding:10px 16px"><span style="font-size:.8rem;color:var(--muted)">' +
+    (state.idx + 1) + " / " + state.queue.length + " · 点「记录」查看该词全部学习历史与难度</span></div>";
+  // input-mode optional: typing is skipped, reveal+grade is the flow
+}
+
+function reveal() {
+  $("ansBox").style.display = "block";
+  $("btnReveal").style.display = "none";
+  $("gradeRow").style.display = "flex";
+}
+
+function grade(id, g) {
+  post("/api/grade", { id: id, grade: g }, function (j) {
+    state.idx++;
+    if (state.idx >= state.queue.length) loadQueue();
+    else renderCard();
+    refreshHeader();
+  });
+}
+
+function flipDiff(id) {
+  var cur = state.queue.find(function (c) { return c.id === id; });
+  var next = (cur && cur.difficulty === "hard") ? "easy" : "hard";
+  post("/api/card/difficulty", { id: id, difficulty: next }, function () {
+    toast("难度已切换为" + (next === "hard" ? "困难" : "简单"));
+    loadQueue();
+  });
+}
+
+function showHistory(id) {
+  fetch("/api/card/history?id=" + id).then(function (r) { return r.json(); }).then(function (log) {
+    var h = "该卡复习历史（共 " + log.length + " 次）:\n";
+    log.forEach(function (l) {
+      var g = ["忘记","困难","认识","简单"][l.grade] || l.grade;
+      h += (l.is_new ? "🆕" : " ") + " " + l.at + "  " + g + "\n";
     });
-    input.addEventListener('keydown', function (e) {
-      if (e.key === 'Enter') { e.preventDefault(); doSearch(input.value.trim()); }
-    });
-    setTimeout(function () { input.focus(); }, 100);
-  }
-  function doSearch(q) {
-    fetch('/api/search?q=' + encodeURIComponent(q)).then(function (r) { return r.json(); }).then(function (list) {
-      results.innerHTML = '';
-      detail.style.display = 'none';
-      if (!list.length) {
-        var li = el('li'); li.style.cursor = 'default';
-        li.appendChild(document.createTextNode('无匹配结果'));
-        results.appendChild(li);
-        return;
-      }
-      list.forEach(function (item) {
-        var li = el('li');
-        var b = el('b'); b.textContent = item.headword; li.appendChild(b);
-        var p = el('p');
-        p.textContent = (item.text && item.text.trim()) ? item.text.slice(0, 140) : '（无释义）';
-        li.appendChild(p);
-        li.onclick = function () { showDetail(item.headword); };
-        results.appendChild(li);
-      });
-    }).catch(function () { results.innerHTML = '<li>搜索失败</li>'; });
-  }
-  function showDetail(w) {
-    fetch('/api/lookup?w=' + encodeURIComponent(w)).then(function (r) { return r.json(); }).then(function (d) {
-      results.innerHTML = '';
-      detail.innerHTML = '';
-      detail.style.display = '';
-      var h = el('h2'); h.textContent = d.headword || w; detail.appendChild(h);
-      var def = el('div', 'def');
-      def.textContent = (d.text && d.text.trim()) ? d.text : '（无释义）';
-      detail.appendChild(def);
-      var add = el('button', 'addbtn', '加入复习');
-      add.onclick = function () {
-        fetch('/api/add', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ word: d.headword || w })
-        }).then(function (r) { return r.json(); }).then(function (x) {
-          if (x && x.ok) { showToast('已加入复习'); }
-          else { showToast((x && x.error) || '无法加入'); }
-        });
-      };
-      detail.appendChild(add);
-      main.scrollTop = 0;
-    });
-  }
+    alert(h);
+  }).catch(function () { toast("暂无记录"); });
+}
 
-  /* ---------- tabs ---------- */
-  function setTab(t) {
-    document.getElementById('tab-review').classList.toggle('active', t === 'review');
-    document.getElementById('tab-lookup').classList.toggle('active', t === 'lookup');
-    if (t === 'review') loadReview();
-    else buildLookup();
-  }
-  document.getElementById('tab-review').onclick = function () { setTab('review'); };
-  document.getElementById('tab-lookup').onclick = function () { setTab('lookup'); };
+// ---- look up tab ----
+function switchTab(tab) {
+  state.tab = tab;
+  $("tabStudy").className = tab === "study" ? "on" : "";
+  $("tabLook").className = tab === "look" ? "on" : "";
+  $("tabStats").className = tab === "stats" ? "on" : "";
+  if (tab === "study") loadQueue();
+  if (tab === "look") renderLook();
+  if (tab === "stats") renderStats();
+}
 
-  /* ---------- pwa ---------- */
-  if ('serviceWorker' in navigator) {
-    window.addEventListener('load', function () {
-      navigator.serviceWorker.register('/sw.js').catch(function () {});
+function renderLook() {
+  var main = $("main");
+  main.innerHTML =
+    '<div class="cardbox" style="padding:14px 16px">' +
+    '<div class="searchbox"><input id="q" placeholder="输入英文或中文搜索，回车查看…" onkeydown="if(event.key===\'Enter\')doSearch()"></div>' +
+    '<button class="reveal" style="border-radius:12px" onclick="doSearch()">搜索</button>' +
+    '<div class="section-title">最近查过的词典结果</div><div id="res"></div></div>' +
+    '<div class="cardbox" style="padding:14px 16px"><div class="section-title" style="margin-top:0">💡 学单词三步走</div>' +
+    '<p style="font-size:.9rem;color:var(--muted);line-height:1.7;margin:0">查词 → 加入复习 → 按"中译英"考察。\n简单模式给例句+中文回忆单词；困难模式只给首字母+中文意思。词组与句式也会出现在复习队列里。</p></div>';
+}
+
+function doSearch() {
+  var q = $("q").value.trim();
+  if (!q) return;
+  fetch("/api/search?q=" + encodeURIComponent(q)).then(function (r) { return r.json(); }).then(function (rows) {
+    var box = $("res");
+    if (!rows || rows.length === 0) { box.innerHTML = '<div class="empty">没有匹配的词条</div>'; return; }
+    var html = "";
+    rows.slice(0, 30).forEach(function (row) {
+      html += '<div class="look-row"><div class="hw">' + esc(row.headword) + '</div>' +
+              '<button class="add" onclick="addWord(\'' + esc(row.headword).replace(/'/g, "\\'") + '\')">加入</button></div>';
     });
-  }
+    box.innerHTML = html;
+  }).catch(function () { toast("搜索失败"); });
+}
 
-  /* ---------- boot ---------- */
-  loadReview();
-})();
+function addWord(w) {
+  post("/api/add", { word: w }, function (j) {
+    toast(j && j.ok ? "已加入复习" + " · 再去学习页查看" : (j && j.error ? j.error : "失败"));
+  });
+}
+
+// ---- stats tab ----
+function renderStats() {
+  var main = $("main");
+  main.innerHTML =
+    '<div class="cardbox" style="padding:14px 16px"><div class="section-title" style="margin-top:0">今日进度</div>' +
+    '<div class="stat-line">' +
+      '<div class="stat-cell"><div class="n" id="stNew">0/0</div><div class="t">新学</div></div>' +
+      '<div class="stat-cell"><div class="n" id="stRev">0/0</div><div class="t">复习</div></div>' +
+      '<div class="stat-cell"><div class="n" id="stDue">?</div><div class="t">词数</div></div>' +
+    '</div>' +
+    '<div class="section-title">词库概况</div>' +
+    '<div class="stat-line">' +
+      '<div class="stat-cell"><div class="n" id="stAll">?</div><div class="t">总词条</div></div>' +
+      '<div class="stat-cell"><div class="n" id="stCards">?</div><div class="t">复习卡</div></div>' +
+      '<div class="stat-cell"><div class="n" id="stPhrases">?</div><div class="t">词组/句式库</div></div>' +
+    '</div></div>' +
+    '<div class="cardbox" style="padding:14px 16px">' +
+    '<div class="section-title" style="margin-top:0">📖 学习记录（每词难度与历史）</div>' +
+    '<div id="recList"></div></div>' +
+    '<div class="cardbox" style="padding:14px 16px"><div class="section-title" style="margin-top:0">词表管理</div><div id="wlList"></div></div>';
+
+  refreshHeader();
+  fetch("/api/stats").then(function (r) { return r.json(); }).then(function (s) {
+    $("stAll").textContent = s.words; $("stCards").textContent = s.cards; $("stDue").textContent = s.due;
+  }).catch(function () {});
+  fetch("/api/phrase_count").then(function (r) { return r.json(); }).then(function (j) {
+    $("stPhrases").textContent = j.count;
+  }).catch(function () { $("stPhrases").textContent = "-"; });
+
+  if (state.settings) {
+    $("stNew").textContent = state.settings.new_done + "/" + state.settings.new_per_day;
+    $("stRev").textContent = state.settings.review_done + "/" + state.settings.review_per_day;
+  }
+  loadRecords();
+  loadWlList();
+}
+
+function loadRecords() {
+  var box = $("recList");
+  if (!box) return;
+  fetch("/api/cards?limit=200").then(function (r) { return r.json(); }).then(function (cards) {
+    if (!cards || cards.length === 0) { box.innerHTML = '<div class="empty">还没有学习记录，先去学习页加几张卡吧</div>'; return; }
+    var html = "";
+    cards.forEach(function (c) {
+      var status = { New: "新词", Learning: "学习中", Review: "已入期", Relearning: "重学" }[c.status] || c.status;
+      var last = c.last_review ? ("上次 " + c.last_review) : "未复习";
+      var miss = c.lapses > 0 ? "忘记" + c.lapses + "次" : "无遗忘";
+      html += '<div class="rec-row"><div class="top">' + tagHtml(c.card_type, c.difficulty) +
+              '<span class="hw">' + esc(c.headword) + '</span></div>' +
+              '<div class="sub">' + status + " · 已学 " + c.reps + " 次 · " + miss + " · " + last + " · 到期 " + (c.due || "—") +
+              ' <span class="ghost warn" style="padding:3px 8px;font-size:.72rem;cursor:pointer" onclick="showHistory(' + c.id + ')">历史</span>' +
+              '</div><div class="thin-progress"><div class="fill" style="width:' + Math.min(100, c.reps * 12) + '%"></div></div></div>';
+    });
+    box.innerHTML = html;
+  }).catch(function () { box.innerHTML = '<div class="empty">读取失败</div>'; });
+}
+
+function loadWlList() {
+  var box = $("wlList");
+  if (!box) return;
+  fetch("/api/wordlists").then(function (r) { return r.json(); }).then(function (ls) {
+    if (!ls || ls.length === 0) { box.innerHTML = '<div class="empty">暂无词表。用命令行导入：lexicon-cli wordlist oxford.db 高考 <词表文件></div>'; return; }
+    var html = "";
+    ls.forEach(function (l) {
+      html += '<div class="setting-row"><div class="lbl">' + esc(l.name) + '<div class="sub">' + l.size + " 个词</div></div>" +
+              '<button class="ghost" onclick="activateList(' + l.id + ')">' + (l.id === state.activeList ? "✓ 当前" : "设为范围") + '</button></div>';
+    });
+    box.innerHTML = html;
+  }).catch(function () {});
+}
+
+function activateList(id) {
+  post("/api/settings", { active_wordlist: String(id) }, function () {
+    state.activeList = id;
+    toast("学习范围已切换");
+    loadWlList();
+    refreshHeader();
+  });
+}
+
+// boot
+$("tabStudy").onclick = function () { switchTab("study"); };
+$("tabLook").onclick = function () { switchTab("look"); };
+$("tabStats").onclick = function () { switchTab("stats"); };
+refreshHeader();
+loadQueue();
+
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').catch(function () {});
+}
 </script>
 </body>
-</html>
-"####;
+</html>"####;

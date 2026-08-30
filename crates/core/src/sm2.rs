@@ -90,12 +90,17 @@ pub fn new_card(headword: String, sense: usize) -> Card {
         id: 0,
         headword,
         sense,
+        card_type: crate::model::CardType::Word,
+        difficulty: crate::model::Difficulty::Easy,
+        source: String::new(),
+        phrase: String::new(),
         due: None,
         interval_days: 0.0,
         ease: DEFAULT_EASE,
         reps: 0,
         lapses: 0,
         status: ReviewStatus::New,
+        created_at: chrono::Local::now().naive_local(),
     }
 }
 
