@@ -351,10 +351,7 @@ fn handle(d: &Db, req: &mut tiny_http::Request) -> tiny_http::Response<std::io::
             }
         }
         (&tiny_http::Method::Get, "/api/search") => {
-            let q = query
-                .and_then(|s| s.strip_prefix("q="))
-                .unwrap_or("")
-                .to_string();
+            let q = percent_decode(query.and_then(|s| s.strip_prefix("q=")).unwrap_or(""));
             match d.search(&q, 50) {
                 Ok(rows) => {
                     let arr: Vec<serde_json::Value> = rows
@@ -370,8 +367,8 @@ fn handle(d: &Db, req: &mut tiny_http::Request) -> tiny_http::Response<std::io::
             }
         }
         (&tiny_http::Method::Get, "/api/lookup") => {
-            let w = query.and_then(|s| s.strip_prefix("w=")).unwrap_or("");
-            match d.lookup_resolved(w) {
+            let w = percent_decode(query.and_then(|s| s.strip_prefix("w=")).unwrap_or(""));
+            match d.lookup_resolved(&w) {
                 Ok(Some(def)) => json_response(
                     200,
                     serde_json::json!({"headword": w, "text": plainify(&def), "found": true}).to_string(),
@@ -437,6 +434,46 @@ fn read_body(req: &mut tiny_http::Request) -> String {
         String::from_utf8_lossy(&tmp).to_string()
     } else {
         String::new()
+    }
+}
+
+/// Decode percent-encoded query values ("a%20b" -> "a b", "+" -> " ").
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hi = hex_val(bytes[i + 1]);
+                let lo = hex_val(bytes[i + 2]);
+                if let (Some(h), Some(l)) = (hi, lo) {
+                    out.push((h << 4) | l);
+                    i += 3;
+                    continue;
+                }
+                out.push(b'%');
+                i += 1;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }
 
