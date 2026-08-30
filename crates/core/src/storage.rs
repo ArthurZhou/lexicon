@@ -58,8 +58,29 @@ impl Db {
         &self.conn
     }
 
+    /// Run `f` inside a single transaction. All inserts/updates made by `f`
+    /// are committed together, which is dramatically faster than per-row
+    /// autocommit for bulk imports.
+    pub fn transaction<T, F>(&mut self, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut Db) -> Result<T>,
+    {
+        self.conn.execute_batch("BEGIN")?;
+        let r = f(self);
+        match r {
+            Ok(v) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(v)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
     /// Insert (or update) a raw entry. The definition is stored as-is (HTML).
-    pub fn insert_entry(&mut self, headword: &str, definition: &str) -> Result<()> {
+    pub fn insert_entry(&self, headword: &str, definition: &str) -> Result<()> {
         // upsert: keep first insertion's definition
         self.conn.execute(
             "INSERT OR IGNORE INTO entries (headword, definition) VALUES (?1, ?2)",
@@ -84,10 +105,67 @@ impl Db {
         }
     }
 
+    /// Look up a word following @@@LINK= aliases (MDX redirects such as
+    /// "10p" -> "ten pence"). Returns the resolved definition, or None when
+    /// neither the word nor its aliases exist. Guarded against cycles.
+    pub fn lookup_resolved(&self, word: &str) -> Result<Option<String>> {
+        let mut current = word.trim().to_string();
+        let mut hops = 0usize;
+        loop {
+            let def = match self.lookup(&current)? {
+                Some(d) => d,
+                None => return Ok(None),
+            };
+            let target = link_target(&def);
+            match target {
+                Some(t) if hops < 8 && !t.trim().eq_ignore_ascii_case(word) => {
+                    current = t.trim().to_string();
+                    hops += 1;
+                }
+                // unevaluated fallback branch kept short for clarity
+                _ => return Ok(Some(def)),
+            }
+        }
+    }
+
+    /// Raw entry lookup (no alias resolution). Used by CLI import.
+    pub fn raw_lookup(&self, word: &str) -> Result<Option<String>> {
+        self.lookup(word)
+    }
+
     pub fn stats(&self) -> Result<(usize, usize)> {
         let words: usize = self.conn.query_row("SELECT COUNT(*) FROM words", [], |r| r.get(0))?;
         let cards: usize = self.conn.query_row("SELECT COUNT(*) FROM cards", [], |r| r.get(0))?;
         Ok((words, cards))
+    }
+
+    /// Number of cards due right now (due <= now or never scheduled).
+    pub fn due_count(&self, now: &chrono::NaiveDateTime) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM cards WHERE due IS NULL OR due <= ?1",
+            params![now.to_string()],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
+    /// Prefix search over known headwords. Returns (headword, definition).
+    /// Definitions can be NULL for words without an imported entry.
+    pub fn search(&self, prefix: &str, limit: i64) -> Result<Vec<(String, Option<String>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT w.headword, e.definition
+             FROM words w LEFT JOIN entries e ON e.headword = w.headword
+             WHERE w.headword LIKE ?1
+             ORDER BY w.headword ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![format!("{prefix}%"), limit], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     /// Add a new card for `headword` (idempotent per word).
@@ -262,6 +340,21 @@ fn parse_status(s: &str) -> ReviewStatus {
         "Relearning" => ReviewStatus::Relearning,
         _ => ReviewStatus::New,
     }
+}
+
+/// If the definition is an MDX redirect ("@@@LINK=target"), return Some(target).
+/// MDX records often carry a trailing NUL byte ("@@@LINK=ten pence\r\n\0"),
+/// so we strip NULs and whitespace before returning the target.
+fn link_target(def: &str) -> Option<String> {
+    const PREFIX: &str = "@@@LINK=";
+    let s = def.trim_start();
+    if s.len() > PREFIX.len() && s[..PREFIX.len()] == *PREFIX {
+        let t = s[PREFIX.len()..].trim_end_matches('\0').trim().to_string();
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+    None
 }
 
 fn status_str(s: ReviewStatus) -> &'static str {
