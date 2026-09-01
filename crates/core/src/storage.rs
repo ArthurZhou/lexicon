@@ -771,10 +771,7 @@ fn parse_card_type(s: &str) -> CardType {
 }
 
 fn parse_difficulty(s: &str) -> Difficulty {
-    match s {
-        "hard" => Difficulty::Hard,
-        _ => Difficulty::Easy,
-    }
+    Difficulty::parse(s)
 }
 
 fn parse_status(s: &str) -> ReviewStatus {

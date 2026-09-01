@@ -12,12 +12,9 @@ oxford.db (SQLite)                   ← 自有格式：词条 + 间隔重复卡
    │
    ├─ lexicon-cli serve               ← 内置 HTTP/PWA
    │      ▼
-   │   手机/电脑浏览器 (PWA)           ← 复习 / 查词 / 添加生词
+   │   手机/电脑浏览器 (PWA)           ← 复习 / 查词 / 添加生词 / 学词组
    │
-   └─ lexicon-cli mcp <db>            ← MCP（Model Context Protocol）服务器
-          ▼
-       AI 助手（Claude Desktop / Cursor / Claude Code 等）以工具调用方式
-       直接查词、取复习队列、评分、管词表与学习记录
+   └─ lexicon-cli review / wordlist   ← 命令行复习与批量导入词表
 ~~~
 
 **是否需要把 MDX 转为自己的格式？—— 需要，`import` 已经做完了这件事。**
@@ -71,50 +68,20 @@ PWA（manifest + service worker + 图标）已内置。把页面“添加到主�
 - **iOS (Safari)**：分享 → “添加到主屏幕”
 - 局域网 HTTP 下 service worker 受浏览器安全策略限制（需要 HTTPS 或 localhost 才注册离线缓存）；若想离线可用，把服务暴露为 HTTPS（如 Tailscale 隧道 / cloudflare tunnel / Caddy 反代）。
 
-### 4. 接入 AI 助手（MCP）
+### 4. 学习与复习（中译英，难度自适应）
 
-`lexicon-cli mcp <db>` 把词典与复习功能暴露为 MCP 工具（JSON-RPC 2.0 over stdio），
-Claude Desktop、Cursor、Claude Code 等 MCP 客户端可以直接调用：
+复习题面按卡片「难度档位」自动匹配你的熟悉程度（SM2 评分会自动升降档，
+也可以在卡片上手动切换）：
 
-    lexicon-cli mcp oxford.db
+| 档位 | 单词题面 | 词组/句式题面 |
+|------|----------|----------------|
+| 简单 | 挖空例句 + 该词中文意思 + 例句中文翻译 | 中文释义 + 挖空例句 + 例句翻译 |
+| 中等 | 挖空例句 + 例句中文翻译（不给词义） | 中文释义 + 例句中文翻译（不给英文例句） |
+| 困难 | 首字母 + 字母数 + 中文意思，不给例句 | 词组首字母骨架 + 中文释义 |
 
-**Claude Desktop 配置示例**（`claude_desktop_config.json`）：
-
-    {
-      "mcpServers": {
-        "lexicon": {
-          "command": "/home/az/lexicon/target/release/lexicon-cli",
-          "args": ["mcp", "/home/az/lexicon/oxford.db"]
-        }
-      }
-    }
-
-**Cursor**：Settings → MCP → Add new MCP server → Command 填
-`/home/az/lexicon/target/release/lexicon-cli mcp /home/az/lexicon/oxford.db`。
-
-暴露的 15 个工具：
-
-| 工具 | 说明 |
-|------|------|
-| `lookup` | 查词：音标、词性、中文释义、例句、固定搭配 |
-| `search` | 前缀搜索词条 |
-| `stats` | 词典规模 + 今日到期数 |
-| `add_card` | 把单词/词组/句式加入复习（可设难度与类型） |
-| `due_queue` | 今日复习队列（受每日新学/复习上限约束，可限定词表） |
-| `grade_card` | 为卡片评分并更新间隔重复排程（0-3） |
-| `card_history` | 单卡复习历史 |
-| `card_records` | 学习记录列表（状态/次数/遗忘/到期/难度） |
-| `set_difficulty` | 标记卡片难度（影响日后题面） |
-| `wordlists` | 列出词表（高考/雅思等） |
-| `settings_get` / `settings_set` | 每日新学数、复习上限、当前词表 |
-| `random_word` | 随机抽词加入复习 |
-| `phrase_count` / `phrases_for` | 词组/句式库规模与查询 |
-
-三种考察模式（题面由 `due_queue` 返回）：
-
-- **单词·简单**：中文释义/义项 + 例句中文翻译作提示 → 回忆单词
-- **单词·困难**：只给首字母 + 中文义项 → 回忆单词
-- **词组/句式**：中文释义 + 中文例句 → 回忆整个固定搭配或句式
+- **背单词**：看中文回忆英文，`忘记得多` 自动降档给更多提示，`连续答简单` 自动升档。
+- **固定搭配与词组**：`phrases --extract` 从词典提取词组/习语库；查词页可直接
+  把某个词的词组/习语一键加入复习，词组卡与单词卡一起进入 SM2 队列。
 
 ### 5. 命令行
 
@@ -135,17 +102,27 @@ lexicon-cli stats oxford.db               # 统计
 |------|------|------|
 | GET  | / | 移动端 PWA 页面 (text/html) |
 | GET  | /api/stats | {words, cards, due} |
-| GET  | /api/due?limit=N | 到期卡片（定义为清洗后的纯文本） |
-| POST | /api/grade | {id, grade: 0-3} 评分 |
+| GET  | /api/due?limit=N&list=W | 当日到期队列（题面按难度档位生成） |
+| POST | /api/grade | {id, grade: 0-3} 评分（自动升降档） |
+| POST | /api/card/difficulty | {id, difficulty: easy/medium/hard} 手动调档 |
+| GET  | /api/card/history?id= | 卡片复习历史 |
 | GET  | /api/search?q= | 前缀搜索词条 |
 | GET  | /api/lookup?w= | 查词（解析 @@@LINK= 重定向） |
 | POST | /api/add | {word} 加入复习 |
+| POST | /api/random | 随机抽词加入复习 |
+| GET  | /api/phrases?limit=&offset= | 浏览词组库 |
+| GET  | /api/phrases/for?word= | 某词的词组/习语/句式列表 |
+| POST | /api/phrase/add | {source, text, type} 加入词组/句式卡 |
+| POST | /api/phrases/rebuild | 从词典全量重建词组库 |
+| GET/POST | /api/settings | 每日新学/复习上限、当前词表 |
+| GET  | /api/wordlists | 词表列表 |
+| GET  | /api/cards?limit= | 学习记录 |
 | GET  | /manifest.json, /sw.js, /icon.svg | PWA 资源 |
 
 ## 核心 crate
 
-- `crates/core`（lexicon-core）：独立 MDX 解析器、SM2 调度、SQLite 存储（捆绑编译，无系统依赖）
-- `crates/cli`（lexicon-cli）：CLI + 内置 HTTP/PWA 服务器 + MCP 服务器（`mcp.rs`，stdio JSON-RPC，零额外依赖）
+- `crates/core`（lexicon-core）：MDX 解析器、OALECD9 释义结构化提取、题面生成（挖空/首字母）、SM2 调度与难度自适应、SQLite 存储（捆绑编译，无系统依赖）。全部业务逻辑都在这里。
+- `crates/cli`（lexicon-cli）：只有交互层——CLI 参数解析、终端复习、HTTP 路由；页面 UI 在 `crates/cli/assets/`（HTML/CSS/JS 与 Rust 分离，`include_str!` 打包）。
 
 ## 数据模型
 

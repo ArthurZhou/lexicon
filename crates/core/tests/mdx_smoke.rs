@@ -15,7 +15,7 @@ fn opens_mdx_and_looks_up_apple() {
     assert!(n > 0, "expected >0 entries, got {n}");
 
     let mut apple: Option<String> = None;
-    for (key, value) in mdx.items() {
+    for (key, value) in mdx.items().expect("decode record blocks") {
         let k = String::from_utf8_lossy(&key).to_string();
         if k.eq_ignore_ascii_case("apple") {
             apple = Some(String::from_utf8_lossy(&value).to_string());

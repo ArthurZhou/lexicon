@@ -134,8 +134,8 @@ impl Mdx {
         &self.header
     }
 
-    pub fn items(&self) -> Vec<Item> {
-        self.decode_record_block().unwrap_or_default()
+    pub fn items(&self) -> Result<Vec<Item>> {
+        self.decode_record_block()
     }
 
     fn read_number<R: Read>(&self, r: &mut R) -> Result<u64> {
@@ -260,16 +260,33 @@ impl Mdx {
         let (bw, term) = if self.version >= 2.0 { (2usize, 1usize) } else { (1, 0) };
         let mut list = Vec::new();
         let mut i = 0usize;
-        while i < key_block_info.len() {
+        // head/tail text sizes are u16 for v2 but u8 for v1
+        let read_size = |data: &[u8]| -> usize {
+            if bw == 2 {
+                read_u16(data) as usize
+            } else {
+                data.first().copied().unwrap_or(0) as usize
+            }
+        };
+        while i + self.number_width <= key_block_info.len() {
             i += self.number_width; // num entries in block (unused)
             // text head
-            let hsize = read_u16(&key_block_info[i..i + bw]) as usize;
+            if i + bw > key_block_info.len() {
+                break;
+            }
+            let hsize = read_size(&key_block_info[i..]);
             i += bw;
             i += if self.encoding != "UTF-16" { hsize + term } else { (hsize + term) * 2 };
             // text tail
-            let tsize = read_u16(&key_block_info[i..i + bw]) as usize;
+            if i + bw > key_block_info.len() {
+                break;
+            }
+            let tsize = read_size(&key_block_info[i..]);
             i += bw;
             i += if self.encoding != "UTF-16" { tsize + term } else { (tsize + term) * 2 };
+            if i + 2 * self.number_width > key_block_info.len() {
+                break;
+            }
             let cs = self.read_number_from_bytes(&key_block_info[i..])?;
             i += self.number_width;
             let ds = self.read_number_from_bytes(&key_block_info[i..])?;
@@ -406,7 +423,7 @@ impl Mdx {
     fn read_number_from_bytes(&self, b: &[u8]) -> Result<u64> {
         if self.number_width == 4 {
             if b.len() < 4 {
-                return bad("short number");
+                return bad(format!("short number (have {} bytes, need 4)", b.len()));
             }
             Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as u64)
         } else {

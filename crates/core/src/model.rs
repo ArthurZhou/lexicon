@@ -36,12 +36,16 @@ impl CardType {
     }
 }
 
-/// Prompt difficulty for Chinese->English word cards.
-/// Easy shows the example sentence + Chinese translation as a hint;
-/// Hard shows only the first letter + a couple of Chinese senses.
+/// Prompt difficulty for Chinese->English cards. Three tiers matched to how
+/// familiar the learner is with the card (auto-adjusted by SM2 grades and
+/// manually overridable):
+///  - Easy:   cloze example sentence + the word's Chinese meaning.
+///  - Medium: cloze example sentence + its Chinese translation (no meaning).
+///  - Hard:   no example, only first letter + Chinese meaning.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Difficulty {
     Easy,
+    Medium,
     Hard,
 }
 
@@ -49,8 +53,36 @@ impl Difficulty {
     pub fn as_str(&self) -> &'static str {
         match self {
             Difficulty::Easy => "easy",
+            Difficulty::Medium => "medium",
             Difficulty::Hard => "hard",
         }
+    }
+
+    /// Parse the difficulty stored in SQLite; unknown values fall back to Easy.
+    pub fn parse(s: &str) -> Difficulty {
+        match s {
+            "hard" => Difficulty::Hard,
+            "medium" => Difficulty::Medium,
+            _ => Difficulty::Easy,
+        }
+    }
+
+    /// Make the prompt easier (more help). Used when the learner forgets.
+    pub fn step_down(&mut self) {
+        *self = match self {
+            Difficulty::Easy => Difficulty::Easy,
+            Difficulty::Medium => Difficulty::Easy,
+            Difficulty::Hard => Difficulty::Medium,
+        };
+    }
+
+    /// Make the prompt harder (less help). Used when the learner finds the
+    /// card easy, but only after they have seen it a few times.
+    pub fn step_up(&mut self) {
+        *self = match self {
+            Difficulty::Easy => Difficulty::Medium,
+            _ => Difficulty::Hard,
+        };
     }
 }
 

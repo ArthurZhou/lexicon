@@ -1,0 +1,14 @@
+{
+  "name": "Lexicon — MDX 词典 / 背单词",
+  "short_name": "Lexicon",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f8fafc",
+  "theme_color": "#2563eb",
+  "description": "本地 MDX 词典查询与间隔重复背单词",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}

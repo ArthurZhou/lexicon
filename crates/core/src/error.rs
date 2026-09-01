@@ -1,3 +1,4 @@
+use crate::mdx_parser;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -11,7 +12,7 @@ pub enum Error {
     #[error("corrupt record: {0}")]
     Corrupt(String),
     #[error("mdx error: {0}")]
-    Mdx(String),
+    Mdx(#[from] mdx_parser::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

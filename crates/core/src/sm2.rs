@@ -27,18 +27,33 @@ fn plus_days(on: NaiveDateTime, days: f64) -> NaiveDateTime {
     on + chrono::Duration::days(days.ceil() as i64)
 }
 
-/// Apply one review and return the updated card.
+/// Apply one review and return the updated card. The prompt difficulty is
+/// auto-adjusted to match how familiar the learner is with the card:
+///  - forgot / hard  -> step down (more help next time)
+///  - easy           -> step up (less help), but only after a few reps so a
+///                      single lucky guess doesn't jump straight to hard
 pub fn apply_review(card: &mut Card, r: Rating) {
     let g = r.grade.min(3);
     match g {
-        0 => again(card),
-        1 => hard(card, r.reviewed_on),
+        0 => {
+            again(card, r.reviewed_on);
+            card.difficulty.step_down();
+        }
+        1 => {
+            hard(card, r.reviewed_on);
+            card.difficulty.step_down();
+        }
         2 => good(card, r.reviewed_on),
-        _ => easy(card, r.reviewed_on),
+        _ => {
+            easy(card, r.reviewed_on);
+            if card.reps >= 2 {
+                card.difficulty.step_up();
+            }
+        }
     }
 }
 
-fn again(card: &mut Card) {
+fn again(card: &mut Card, on: NaiveDateTime) {
     card.lapses += 1;
     card.ease = (card.ease - 0.20).max(MIN_EASE);
     card.reps = 0;
@@ -46,9 +61,12 @@ fn again(card: &mut Card) {
         ReviewStatus::Review => ReviewStatus::Relearning,
         s => s,
     };
-    // relearn in 1 minute (represented as due today)
+    // relearn in 1 minute (represented as due right now)
     card.interval_days = 0.0;
-    card.due = None; // caller sets "now" granularity
+    // NOTE: due must stay Some(..) — the daily web queue only picks up cards
+    // with a non-NULL due, so None here would make lapsed cards disappear
+    // from the review queue forever.
+    card.due = Some(on);
 }
 
 fn hard(card: &mut Card, on: NaiveDateTime) {
@@ -137,6 +155,36 @@ mod tests {
         assert_eq!(c.reps, 0);
         assert!(c.interval_days < 1.0);
         assert_eq!(c.status, ReviewStatus::Relearning);
+    }
+
+    #[test]
+    fn lapsed_card_stays_due_now() {
+        // Regression: lapsed cards used to get due=None, which made them
+        // disappear from the daily review queue (it only picks due IS NOT NULL).
+        let mut c = new_card("apple".into(), 0);
+        apply_review(&mut c, Rating::new(2, day("2026-08-29 09:00:00")));
+        apply_review(&mut c, Rating::new(0, day("2026-08-30 09:00:00")));
+        assert_eq!(c.due, Some(day("2026-08-30 09:00:00")));
+    }
+
+    #[test]
+    fn difficulty_matches_familiarity() {
+        use crate::model::Difficulty;
+        let mut c = new_card("apple".into(), 0);
+        // forgetting immediately drops the prompt difficulty
+        apply_review(&mut c, Rating::new(2, day("2026-08-29 09:00:00")));
+        apply_review(&mut c, Rating::new(0, day("2026-08-30 09:00:00")));
+        assert_eq!(c.difficulty, Difficulty::Easy);
+        // a couple of easy grades ramp it back up
+        apply_review(&mut c, Rating::new(3, day("2026-08-31 09:00:00")));
+        assert_eq!(c.difficulty, Difficulty::Easy); // first easy after lapse: no bump yet
+        apply_review(&mut c, Rating::new(3, day("2026-09-03 09:00:00")));
+        assert_eq!(c.difficulty, Difficulty::Medium);
+        apply_review(&mut c, Rating::new(3, day("2026-09-10 09:00:00")));
+        assert_eq!(c.difficulty, Difficulty::Hard);
+        // forgetting again eases the prompt back off
+        apply_review(&mut c, Rating::new(0, day("2026-09-24 09:00:00")));
+        assert_eq!(c.difficulty, Difficulty::Medium);
     }
 
     #[test]
