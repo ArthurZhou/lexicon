@@ -100,11 +100,27 @@ fn handle(d: &Db, req: &mut tiny_http::Request) -> Resp {
                         .and_then(|v| v.parse::<i64>().ok())
                 })
                 .or(Some(0));
+            // Shanbay-style top-up: when the daily new quota is not
+            // exhausted but no pending new cards remain, draw new words
+            // (respecting the active wordlist scope) so the queue never
+            // stalls at "task done".
+            let mut auto_drawn = 0usize;
+            let auto_new = d.auto_new_enabled().unwrap_or(true);
+            if auto_new {
+                // Best-effort top-up; failures fall back to the normal queue.
+                if let Ok((_, new_left, _)) = d.daily_due_queue(&now, 0, wl) {
+                    let pending = d.pending_new_count(wl).unwrap_or(0);
+                    let topup = new_left.saturating_sub(pending as u32);
+                    if topup > 0 {
+                        auto_drawn = d.auto_draw_new_cards(wl, topup).unwrap_or(0);
+                    }
+                }
+            }
             match d.daily_due_queue(&now, limit, wl) {
                 Ok((cards, new_left, review_left)) => {
                     let arr: Vec<serde_json::Value> = cards
                         .into_iter()
-                        .map(|(id, headword, ctype, diff, phrase)| {
+                        .map(|(id, headword, ctype, diff, phrase, is_new)| {
                             let prompt =
                                 build_card_prompt(d, id, &headword, &ctype, &diff, &phrase);
                             serde_json::json!({
@@ -113,6 +129,7 @@ fn handle(d: &Db, req: &mut tiny_http::Request) -> Resp {
                                 "card_type": ctype,
                                 "difficulty": diff,
                                 "phrase": phrase,
+                                "is_new": is_new,
                                 "prompt": prompt,
                             })
                         })
@@ -123,12 +140,35 @@ fn handle(d: &Db, req: &mut tiny_http::Request) -> Resp {
                             "cards": arr,
                             "new_left": new_left,
                             "review_left": review_left,
+                            "auto_drawn": auto_drawn,
+                            "auto_new": auto_new,
+                            "scope_remaining": d.undrawn_word_count(wl).unwrap_or(0),
                         })
                         .to_string(),
                     )
                 }
                 Err(e) => json_response(500, format!("{{\"error\": \"{e}\"}}")),
             }
+        }
+
+        // Manual "draw new words now" (empty-state button).
+        (&tiny_http::Method::Post, "/api/auto_draw") => {
+            with_json_body(req, |v| {
+                let want = v["want"].as_u64().unwrap_or(10).min(200) as u32;
+                let wl = d
+                    .get_setting("active_wordlist")
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(0);
+                match d.auto_draw_new_cards(Some(wl), want) {
+                    Ok(n) => json_response(
+                        200,
+                        serde_json::json!({"ok": true, "drawn": n}).to_string(),
+                    ),
+                    Err(e) => json_response(500, format!("{{\"ok\":false,\"error\":\"{e}\"}}")),
+                }
+            })
         }
 
         // ---- grading ----
@@ -183,6 +223,7 @@ fn handle(d: &Db, req: &mut tiny_http::Request) -> Resp {
                 .get_setting("active_wordlist")
                 .unwrap_or_default()
                 .and_then(|v| v.parse::<i64>().ok());
+            let auto_new = d.auto_new_enabled().unwrap_or(true);
             json_response(
                 200,
                 serde_json::json!({
@@ -191,6 +232,8 @@ fn handle(d: &Db, req: &mut tiny_http::Request) -> Resp {
                     "new_done": new_done,
                     "review_done": rev_done,
                     "active_wordlist": active.unwrap_or(0),
+                    "auto_new": auto_new,
+                    "scope_remaining": d.undrawn_word_count(Some(active.unwrap_or(0))).unwrap_or(0),
                 })
                 .to_string(),
             )
@@ -205,6 +248,9 @@ fn handle(d: &Db, req: &mut tiny_http::Request) -> Resp {
                 }
                 if let Some(wl) = v["active_wordlist"].as_str() {
                     let _ = d.set_setting("active_wordlist", wl);
+                }
+                if let Some(a) = v["auto_new"].as_bool() {
+                    let _ = d.set_setting("auto_new", if a { "1" } else { "0" });
                 }
                 json_response(200, "{\"ok\":true}".into())
             })

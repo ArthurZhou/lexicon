@@ -134,8 +134,15 @@ fn main() -> ExitCode {
             // phrases <db> --extract  —  build the whole phrase bank from entries
             let db = need(&args, 2, "phrases <db> [--extract | <source-word>]");
             if args.get(3).map(|s| s.as_str()) == Some("--extract") {
-                match Db::open(db).and_then(|d| lexicon_core::study::rebuild_phrase_bank(&d)) {
+                match Db::open(db).and_then(|d| {
+                    lexicon_core::study::rebuild_phrase_bank_with(&d, |done| {
+                        if done % 2000 == 0 {
+                            eprint!("\r  已处理 {done} 词条 …");
+                        }
+                    })
+                }) {
                     Ok(n) => {
+                        eprintln!();
                         println!("phrase bank: {n} phrases extracted");
                         ExitCode::SUCCESS
                     }
@@ -208,20 +215,41 @@ fn import(file: &str, db: &str) -> anyhow::Result<usize> {
     let _ = std::fs::remove_file(db); // fresh db
     let mut d = Db::open(db)?;
     let mdx = lexicon_core::mdx_parser::Mdx::open(file)?;
+    println!("导入词典: {file}");
+    let t0 = std::time::Instant::now();
     // Bulk insert in one transaction: per-row autocommit made imports so slow
     // that large dictionaries (11万+ entries) got cut off by timeouts, leaving
     // an incomplete word list behind.
-    Ok(d.transaction(|tx| {
+    let n = d.transaction(|tx| {
         let mut n = 0usize;
         for (key, val) in mdx.items()? {
             let headword = String::from_utf8_lossy(&key).to_string();
             let def = String::from_utf8_lossy(&val).to_string();
             tx.insert_entry(&headword, &def)?;
             n += 1;
+            if n % 2000 == 0 {
+                eprint!("\r  词条 {n} …");
+            }
         }
+        eprintln!("\r  词条 {n} ✓");
         Ok(n)
-    })?) // ? converts lexicon_core::Error -> anyhow
-}
+    })?;
+    // Auto-build the phrase bank right after the dictionary is in — a fresh
+    // import without a phrase table makes the 词组 page useless until the
+    // user remembers to run `phrases --extract` manually.
+    println!("提取词组/习语库…");
+    let p = lexicon_core::study::rebuild_phrase_bank_with(&d, |done| {
+        if done % 2000 == 0 {
+            eprint!("\r  已处理 {done} 词条 …");
+        }
+    })?;
+    eprintln!("\r  词组提取完成 ✓");
+    println!(
+        "共导入 {n} 条词条、{p} 条词组，用时 {:.1} 秒",
+        t0.elapsed().as_secs_f32()
+    );
+    Ok(n)
+} // ? converts lexicon_core::Error -> anyhow
 
 fn lookup(db: &str, word: &str) -> anyhow::Result<Option<String>> {
     let d = Db::open(db)?;
@@ -293,6 +321,7 @@ fn load_scope(db: &str, file: &str, wl_name: Option<&str>) -> anyhow::Result<usi
     let content = std::fs::read_to_string(file)?;
     let mut n = 0usize;
     let mut headwords: Vec<String> = Vec::new();
+    let mut done = 0usize;
     for line in content.lines() {
         let w = line.trim();
         if w.is_empty() {
@@ -302,6 +331,13 @@ fn load_scope(db: &str, file: &str, wl_name: Option<&str>) -> anyhow::Result<usi
             n += 1;
         }
         headwords.push(w.to_string());
+        done += 1;
+        if done % 500 == 0 {
+            eprint!("\r  已处理 {done} 词 …");
+        }
+    }
+    if done >= 500 {
+        eprintln!("\r  已处理 {done} 词 ✓");
     }
     if let Some(id) = wl_id {
         d.add_wordlist_words(id, &headwords)?;
@@ -316,6 +352,7 @@ fn import_wordlist(db: &str, name: &str, file: &str, default_type: &str) -> anyh
     let content = std::fs::read_to_string(file)?;
     let mut count = 0usize;
     let mut headwords: Vec<String> = Vec::new();
+    let mut done = 0usize;
     for raw in content.lines() {
         if let Some(l) = lexicon_core::study::parse_wordlist_line(raw, default_type) {
             let id = d.add_new_card_full(
@@ -332,7 +369,14 @@ fn import_wordlist(db: &str, name: &str, file: &str, default_type: &str) -> anyh
                 }
                 headwords.push(l.headword);
             }
+            done += 1;
+            if done % 500 == 0 {
+                eprint!("\r  已处理 {done} 词 …");
+            }
         }
+    }
+    if done >= 500 {
+        eprintln!("\r  已处理 {done} 词 ✓");
     }
     d.add_wordlist_words(wl_id, &headwords)?;
     Ok(count)

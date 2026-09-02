@@ -26,41 +26,54 @@
   }
   #app { display: flex; flex-direction: column; height: 100%; }
   header {
-    background: linear-gradient(135deg, #1d4ed8, #2563eb, #3b82f6);
-    color: #fff; padding: calc(12px + var(--safe-t)) 16px 22px 16px;
+    background: linear-gradient(135deg, #1e3a8a, #1d4ed8 55%, #3b82f6);
+    color: #fff; padding: calc(12px + var(--safe-t)) 16px 20px 16px;
+    border-radius: 0 0 22px 22px;
+    box-shadow: 0 6px 20px rgba(29,78,216,.25);
   }
-  header .toprow { display: flex; align-items: center; justify-content: space-between; }
-  header h1 { margin: 0; font-size: 1.3rem; font-weight: 800; }
-  header .mini { font-size: .72rem; opacity: .85; }
-  header .progress { margin-top: 10px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-  header .pill {
-    background: rgba(255,255,255,.16); border-radius: 10px; padding: 8px 12px;
-    font-size: .82rem; font-weight: 600; display: flex; align-items: center; gap: 8px;
-  }
-  header .pill b { font-size: 1.05rem; }
+  header .toprow { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  header h1 { margin: 0; font-size: 1.3rem; font-weight: 800; letter-spacing: .02em; }
+  header h1 small { font-size: .68rem; font-weight: 600; opacity: .8; display: block; margin-top: 2px; }
   header select {
-    background: rgba(255,255,255,.16); color: #fff; border: 0; border-radius: 10px;
-    padding: 8px 10px; font-size: .82rem; font-weight: 600; max-width: 130px;
+    background: rgba(255,255,255,.16); color: #fff; border: 1px solid rgba(255,255,255,.25);
+    border-radius: 10px; padding: 8px 10px; font-size: .82rem; font-weight: 600; max-width: 150px;
   }
   header select option { color: #0f172a; }
+  header .progress { margin-top: 12px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  header .quota { background: rgba(255,255,255,.14); border-radius: 12px; padding: 9px 12px 11px; }
+  header .quota .row { display: flex; align-items: baseline; gap: 6px; font-size: .78rem; font-weight: 600; opacity: .95; }
+  header .quota .row b { font-size: 1.15rem; font-weight: 800; }
+  header .quota .row .lim { opacity: .75; }
+  header .bar { margin-top: 7px; height: 6px; border-radius: 999px; background: rgba(255,255,255,.22); overflow: hidden; }
+  header .bar i {
+    display: block; height: 100%; border-radius: 999px; background: #fff;
+    transition: width .5s cubic-bezier(.22,1,.36,1); width: 0;
+  }
+  header .bar i.full { background: #86efac; }
   main { flex: 1; overflow-y: auto; padding: 0 14px calc(86px + var(--safe-b)); }
   .page { display: none; }
   .page.on { display: block; }
   .cardbox {
-    background: var(--card); border-radius: 18px; margin: 12px auto; max-width: 640px;
+    background: var(--card); border-radius: 18px; margin: 14px auto; max-width: 640px;
     box-shadow: 0 1px 3px rgba(15,23,42,.08), 0 10px 30px rgba(15,23,42,.08);
     border: 1px solid var(--line); overflow: hidden;
+  }
+  .cardbox.pop { animation: pop .3s cubic-bezier(.22,1,.36,1); }
+  @keyframes pop {
+    from { transform: translateY(14px) scale(.98); opacity: 0; }
+    to { transform: none; opacity: 1; }
   }
   .tag { display: inline-block; font-size: .72rem; font-weight: 700; padding: 3px 10px; border-radius: 999px; letter-spacing: .04em; }
   .tag.word { background: #dbeafe; color: #1d4ed8; }
   .tag.phrase { background: #dcfce7; color: #15803d; }
   .tag.pattern { background: #fef3c7; color: #b45309; }
+  .tag.isnew { background: #fae8ff; color: #a21caf; }
   .tag.tier-easy { background: #e0f2fe; color: #0369a1; }
   .tag.tier-medium { background: #fef9c3; color: #a16207; }
   .tag.tier-hard { background: #fee2e2; color: #b91c1c; }
-  .cardhead { display: flex; gap: 6px; align-items: center; padding: 14px 20px 0; }
+  .cardhead { display: flex; gap: 6px; align-items: center; padding: 14px 20px 0; flex-wrap: wrap; }
   .prompt {
-    padding: 16px 20px 14px; font-size: 1.28rem; font-weight: 700; line-height: 1.55;
+    padding: 18px 20px 14px; font-size: 1.32rem; font-weight: 700; line-height: 1.6;
     word-break: break-word; white-space: pre-wrap; min-height: 84px;
   }
   .prompt .blank {
@@ -68,7 +81,7 @@
     color: transparent; user-select: none;
   }
   .hint { padding: 0 20px 8px; color: var(--muted); font-size: .95rem; line-height: 1.6; word-break: break-word; white-space: pre-wrap; }
-  .answer-box { padding: 10px 20px 6px; display: none; }
+  .answer-box { padding: 10px 20px 6px; display: none; animation: pop .25s ease; }
   .answer-box.show { display: block; }
   .answer-box .aw {
     background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 12px;
@@ -81,7 +94,9 @@
   button {
     border: 0; border-radius: 12px; font-weight: 700; cursor: pointer;
     touch-action: manipulation; font-size: .98rem; color: #fff; font-family: inherit;
+    transition: transform .08s ease, filter .15s ease;
   }
+  button:active { transform: scale(.96); }
   .btn { flex: 1; padding: 15px 8px; font-size: 1rem; font-weight: 800; }
   .btn.again { background: var(--again); }
   .btn.hard { background: var(--hard); }
@@ -91,40 +106,64 @@
     width: 100%; display: block; margin: 0; padding: 16px;
     background: var(--brand); color: var(--brand-ink); font-size: 1.05rem; border-radius: 0;
   }
+  .reveal kbd {
+    font-family: inherit; background: rgba(255,255,255,.2); border-radius: 6px;
+    padding: 1px 7px; font-size: .8rem; margin-left: 8px;
+  }
   .ghost {
     background: #eef2ff; color: #3730a3; border: 1px solid #c7d2fe;
-    padding: 9px 14px; border-radius: 10px; font-size: .86rem; font-weight: 700; cursor: pointer;
+    padding: 10px 14px; border-radius: 10px; font-size: .86rem; font-weight: 700; cursor: pointer;
   }
+  .ghost:disabled { opacity: .55; }
   .ghost.warn { background: #fef2f2; color: #991b1b; border-color: #fecaca; }
-  .section-title { font-size: .8rem; font-weight: 800; color: var(--muted); letter-spacing: .1em; margin: 18px 6px 8px; }
+  .ghost.big { width: 100%; padding: 14px; font-size: .98rem; border-radius: 14px; }
+  .section-title { font-size: .8rem; font-weight: 800; color: var(--muted); letter-spacing: .1em; margin: 20px 6px 8px; }
   .row-item {
-    background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px;
+    background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 11px 13px;
     margin-bottom: 8px;
   }
   .row-item .hw { font-weight: 700; font-size: 1.02rem; word-break: break-word; }
   .row-item .sub { color: var(--muted); font-size: .82rem; margin-top: 4px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
   .row-item .actions { margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap; }
-  .row-item.click { cursor: pointer; }
-  .searchbox { display: flex; gap: 8px; padding: 12px 0; }
+  .row-item.click { cursor: pointer; transition: border-color .15s; }
+  .row-item.click:hover { border-color: var(--brand); }
+  .searchbox { display: flex; gap: 8px; padding: 14px 0; }
   .searchbox input {
     flex: 1; border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px;
-    font-size: 1rem; background: #fff; font-family: inherit;
+    font-size: 1rem; background: #fff; font-family: inherit; outline: none;
   }
+  .searchbox input:focus { border-color: var(--brand); box-shadow: 0 0 0 3px rgba(37,99,235,.12); }
   .searchbox button { background: var(--brand); color: #fff; border-radius: 12px; padding: 0 18px; }
   .setting-row {
     background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px;
     margin-bottom: 10px; display: flex; align-items: center; gap: 12px;
   }
   .setting-row .lbl { flex: 1; font-weight: 600; font-size: .92rem; }
+  .setting-row .lbl small { display: block; color: var(--muted); font-weight: 400; font-size: .76rem; margin-top: 3px; }
   .setting-row input[type=number] {
     width: 76px; border: 1px solid var(--line); border-radius: 10px; padding: 8px; font-size: .95rem;
   }
-  .stat-line { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin: 12px 0; }
-  .stat-cell { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 10px; text-align: center; }
+  /* toggle switch */
+  .switch { position: relative; width: 46px; height: 26px; flex: none; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch .track {
+    position: absolute; inset: 0; background: #cbd5e1; border-radius: 999px; transition: background .2s;
+  }
+  .switch .track::after {
+    content: ""; position: absolute; top: 3px; left: 3px; width: 20px; height: 20px;
+    background: #fff; border-radius: 50%; transition: transform .2s; box-shadow: 0 1px 3px rgba(0,0,0,.25);
+  }
+  .switch input:checked + .track { background: var(--good); }
+  .switch input:checked + .track::after { transform: translateX(20px); }
+  .stat-line { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin: 14px 0; }
+  .stat-cell { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 11px; text-align: center; }
   .stat-cell .n { font-size: 1.2rem; font-weight: 800; }
   .stat-cell .t { font-size: .72rem; color: var(--muted); font-weight: 600; margin-top: 2px; }
-  .empty { text-align: center; color: var(--muted); padding: 40px 20px; font-size: .95rem; }
-  .empty .big { font-size: 2.2rem; margin-bottom: 10px; }
+  .empty { text-align: center; color: var(--muted); padding: 34px 20px; font-size: .95rem; }
+  .empty .big { font-size: 2.6rem; margin-bottom: 8px; }
+  .empty .desc { line-height: 1.8; }
+  .empty .desc small { color: #94a3b8; }
+  .empty .acts { margin-top: 16px; display: flex; flex-direction: column; gap: 8px; max-width: 320px; margin-left: auto; margin-right: auto; }
   nav {
     position: fixed; bottom: 0; left: 0; right: 0; z-index: 20;
     background: rgba(255,255,255,.96); backdrop-filter: blur(10px);
@@ -162,12 +201,18 @@
 <div id="app">
   <header>
     <div class="toprow">
-      <h1>Lexicon</h1>
+      <h1>Lexicon<small id="scopeNote">全部词库</small></h1>
       <select id="listSel"><option value="0">全部词库</option></select>
     </div>
     <div class="progress">
-      <div class="pill">🆕 新学 <b id="pNew">0</b><span class="mini" id="pNewLim">/20</span></div>
-      <div class="pill">🔁 复习 <b id="pRev">0</b><span class="mini" id="pRevLim">/100</span></div>
+      <div class="quota">
+        <div class="row">🆕 新学 <b id="pNew">0</b><span class="lim" id="pNewLim">/20</span></div>
+        <div class="bar"><i id="barNew"></i></div>
+      </div>
+      <div class="quota">
+        <div class="row">🔁 复习 <b id="pRev">0</b><span class="lim" id="pRevLim">/100</span></div>
+        <div class="bar"><i id="barRev"></i></div>
+      </div>
     </div>
   </header>
   <main>
@@ -176,6 +221,7 @@
       <div class="cardbox" id="cardBox" style="display:none">
         <div class="cardhead">
           <span class="tag" id="cardType">word</span>
+          <span class="tag isnew" id="cardNew" style="display:none">新词</span>
           <span class="tag" id="cardTier">easy</span>
           <span class="mini" style="margin-left:auto;color:var(--muted);font-size:.72rem" id="cardSource"></span>
         </div>
@@ -185,17 +231,18 @@
           <div class="aw"><span id="answerWord"></span> <span class="phon" id="answerPhon"></span></div>
           <div class="meta" id="answerMeta"></div>
         </div>
-        <button class="reveal" id="btnReveal">显示答案</button>
+        <button class="reveal" id="btnReveal">显示答案<kbd>空格</kbd></button>
         <div class="button-row" id="gradeRow" style="display:none">
-          <button class="btn again" data-g="0">忘了</button>
-          <button class="btn hard" data-g="1">困难</button>
-          <button class="btn good" data-g="2">认识</button>
-          <button class="btn easy" data-g="3">简单</button>
+          <button class="btn again" data-g="0">忘了 <small>1</small></button>
+          <button class="btn hard" data-g="1">困难 <small>2</small></button>
+          <button class="btn good" data-g="2">认识 <small>3</small></button>
+          <button class="btn easy" data-g="3">简单 <small>4</small></button>
         </div>
       </div>
-      <div class="empty" id="reviewEmpty">
+      <div class="empty" id="reviewEmpty" style="display:none">
         <div class="big">🎉</div>
-        今日任务已完成<br><small>去「查词」添加生词，或到「词组」学固定搭配</small>
+        <div class="desc" id="emptyMsg">今日任务已完成</div>
+        <div class="acts" id="emptyActs"></div>
       </div>
     </section>
 
@@ -218,7 +265,7 @@
         <button id="searchGo">搜索</button>
       </div>
       <div id="searchResults"></div>
-      <button class="ghost" id="btnRandom" style="width:100%">🎲 随机抽一个生词</button>
+      <button class="ghost big" id="btnRandom" style="margin-top:6px">🎲 随机抽一个生词</button>
     </section>
 
     <!-- ===== 更多 ===== -->
@@ -226,16 +273,20 @@
       <div class="stat-line" id="statCells"></div>
       <div class="section-title">每日上限</div>
       <div class="setting-row">
-        <span class="lbl">新学卡片 / 天</span>
+        <span class="lbl">新学卡片 / 天<small>名额未用完时自动从词库抽新词</small></span>
         <input type="number" id="setNew" min="0" max="500">
       </div>
       <div class="setting-row">
         <span class="lbl">复习卡片 / 天</span>
         <input type="number" id="setRev" min="0" max="2000">
       </div>
-      <button class="ghost" id="setSave" style="width:100%;margin-bottom:14px">保存设置</button>
+      <div class="setting-row">
+        <span class="lbl">自动抽新词<small>新学名额没用完时，自动从当前词库抽取生词加入学习（像扇贝每天自动安排新词）</small></span>
+        <label class="switch"><input type="checkbox" id="setAuto"><span class="track"></span></label>
+      </div>
+      <button class="ghost big" id="setSave" style="margin-bottom:14px">保存设置</button>
       <div class="section-title">维护</div>
-      <button class="ghost" id="btnRebuild" style="width:100%;margin-bottom:14px">重建词组库（从词典提取全部词组）</button>
+      <button class="ghost big" id="btnRebuild" style="margin-bottom:14px">重建词组库（从词典提取全部词组）</button>
       <div class="section-title">学习记录</div>
       <div id="recordList"></div>
     </section>
@@ -261,13 +312,14 @@
 <script>
 "use strict";
 var $ = function (id) { return document.getElementById(id); };
-var state = { card: null, list: 0, bankOffset: 0 };
+var state = { card: null, list: 0, bankOffset: 0, autoNew: true, scopeRemaining: 0 };
 
 function toast(msg) {
   var t = $("toast");
   t.textContent = msg;
   t.classList.add("show");
-  setTimeout(function () { t.classList.remove("show"); }, 1800);
+  clearTimeout(t._h);
+  t._h = setTimeout(function () { t.classList.remove("show"); }, 2200);
 }
 
 function api(path, opts) {
@@ -292,14 +344,25 @@ document.querySelectorAll("nav button").forEach(function (b) {
 });
 
 /* ---- header: settings + wordlist selector ---- */
+function setBar(id, done, lim) {
+  var el = $(id);
+  var pct = lim > 0 ? Math.min(100, Math.round(done * 100 / lim)) : 100;
+  el.style.width = pct + "%";
+  el.className = pct >= 100 ? "full" : "";
+}
 function loadHeader() {
   api("/api/settings").then(function (s) {
     $("pNew").textContent = s.new_done;
     $("pNewLim").textContent = "/" + s.new_per_day;
     $("pRev").textContent = s.review_done;
     $("pRevLim").textContent = "/" + s.review_per_day;
+    setBar("barNew", s.new_done, s.new_per_day);
+    setBar("barRev", s.review_done, s.review_per_day);
     $("setNew").value = s.new_per_day;
     $("setRev").value = s.review_per_day;
+    $("setAuto").checked = !!s.auto_new;
+    state.autoNew = !!s.auto_new;
+    state.scopeRemaining = s.scope_remaining || 0;
     state.list = s.active_wordlist || 0;
   });
   api("/api/wordlists").then(function (lists) {
@@ -311,6 +374,8 @@ function loadHeader() {
       sel.appendChild(o);
     });
     sel.value = String(state.list);
+    var cur = lists.filter(function (w) { return w.id === state.list; })[0];
+    $("scopeNote").textContent = cur ? "约束词表：" + cur.name : "全部词库";
   });
 }
 $("listSel").addEventListener("change", function () {
@@ -319,13 +384,21 @@ $("listSel").addEventListener("change", function () {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ active_wordlist: this.value })
-  }).then(function () { nextCard(); });
+  }).then(function () {
+    toast(state.list ? "已限定到该词表，新词只会从词表中抽取" : "已切回全部词库");
+    loadHeader();
+    nextCard();
+  });
 });
 $("setSave").addEventListener("click", function () {
   api("/api/settings", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ new_per_day: +$("setNew").value, review_per_day: +$("setRev").value })
+    body: JSON.stringify({
+      new_per_day: +$("setNew").value,
+      review_per_day: +$("setRev").value,
+      auto_new: $("setAuto").checked
+    })
   }).then(function () { toast("已保存"); loadHeader(); });
 });
 
@@ -333,27 +406,85 @@ $("setSave").addEventListener("click", function () {
 function tierName(d) { return d === "hard" ? "困难" : d === "medium" ? "中等" : "简单"; }
 function typeName(k) { return k === "phrase" ? "词组" : k === "pattern" ? "句型" : "单词"; }
 
+function showEmpty(msg, acts) {
+  state.card = null;
+  $("cardBox").style.display = "none";
+  var e = $("reviewEmpty");
+  e.style.display = "block";
+  $("emptyMsg").innerHTML = msg;
+  var box = $("emptyActs");
+  box.innerHTML = "";
+  (acts || []).forEach(function (a) {
+    var b = document.createElement("button");
+    b.className = "ghost big";
+    b.textContent = a.label;
+    b.addEventListener("click", a.fn);
+    box.appendChild(b);
+  });
+}
+
+function drawNew(want) {
+  api("/api/auto_draw", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ want: want })
+  }).then(function (r) {
+    if (r.ok && r.drawn > 0) {
+      toast("已抽取 " + r.drawn + " 个新词，开始学！");
+      nextCard();
+    } else {
+      toast("当前词库里的词都已加入学习");
+    }
+  });
+}
+
 function nextCard() {
   api("/api/due?limit=1&list=" + state.list).then(function (r) {
+    if (r.auto_drawn > 0) {
+      toast("已自动加入 " + r.auto_drawn + " 个新词");
+    }
+    state.scopeRemaining = r.scope_remaining || 0;
+    loadHeader();
     if (!r.cards || !r.cards.length) {
-      state.card = null;
-      $("cardBox").style.display = "none";
-      $("reviewEmpty").style.display = "block";
-      loadHeader();
+      // Task done — explain why and offer actions.
+      var msg, acts = [];
+      if (!r.auto_new && r.new_left > 0) {
+        msg = "今日新学还有 " + r.new_left + " 个名额，但自动抽词已关闭。<br>" +
+              "<small>可在「更多」里打开「自动抽新词」，或到「查词」手动添加生词。</small>";
+        acts.push({ label: "🎯 抽一批新词", fn: function () { drawNew(r.new_left); } });
+      } else if (r.new_left > 0 && r.review_left > 0) {
+        msg = "词库已经学完了！<br><small>今日新学还剩 " + r.new_left + "、复习还剩 " + r.review_left +
+              "，但没有可抽的词。去「查词」添加，或换一个更大的词表。</small>";
+      } else {
+        msg = "今日任务已完成 🎉<br><small>" +
+              (r.new_left > 0 ? "新学名额还剩 " + r.new_left + "，" : "") +
+              "可以提前学，或到「词组」学固定搭配。</small>";
+        if (r.new_left > 0) {
+          acts.push({ label: "🎯 继续抽新词学", fn: function () { drawNew(r.new_left); } });
+        }
+      }
+      if (state.list) {
+        msg += "<br><small>当前约束词表剩余未学：" + state.scopeRemaining + " 个词</small>";
+      }
+      showEmpty(msg, acts);
       return;
     }
     state.card = r.cards[0];
     renderCard(state.card);
-    loadHeader();
   });
 }
 
 function renderCard(c) {
   var p = c.prompt;
-  $("cardBox").style.display = "block";
+  var box = $("cardBox");
+  box.style.display = "block";
   $("reviewEmpty").style.display = "none";
+  box.classList.remove("pop");
+  void box.offsetWidth; // restart animation
+  box.classList.add("pop");
   $("cardType").textContent = typeName(p.kind);
   $("cardType").className = "tag " + p.kind;
+  $("cardNew").style.display = c.is_new ? "inline-block" : "none";
   $("cardTier").textContent = "提示·" + tierName(c.difficulty);
   $("cardTier").className = "tag tier-" + c.difficulty;
   $("cardSource").textContent = p.kind === "word" ? "" : "源自 " + p.extra.source;
@@ -372,11 +503,12 @@ function renderCard(c) {
   $("gradeRow").style.display = "none";
 }
 
-$("btnReveal").addEventListener("click", function () {
+function reveal() {
   $("answerBox").classList.add("show");
   $("btnReveal").style.display = "none";
   $("gradeRow").style.display = "flex";
-});
+}
+$("btnReveal").addEventListener("click", reveal);
 document.querySelectorAll("#gradeRow .btn").forEach(function (b) {
   b.addEventListener("click", function () {
     if (!state.card) return;
@@ -387,6 +519,21 @@ document.querySelectorAll("#gradeRow .btn").forEach(function (b) {
       body: JSON.stringify({ id: id, grade: +b.dataset.g })
     }).then(function () { nextCard(); });
   });
+});
+
+/* keyboard shortcuts (desktop): space = reveal, 1-4 = grade */
+document.addEventListener("keydown", function (e) {
+  if (e.target && /INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) return;
+  if (state.card && $("btnReveal").style.display !== "none" &&
+      (e.key === " " || e.key === "Enter")) {
+    e.preventDefault();
+    reveal();
+    return;
+  }
+  if (state.card && $("gradeRow").style.display === "flex" && e.key >= "1" && e.key <= "4") {
+    var btn = document.querySelector('#gradeRow .btn[data-g="' + (e.key - 1) + '"]');
+    if (btn) btn.click();
+  }
 });
 
 /* ---- phrase bank ---- */
@@ -421,7 +568,7 @@ function loadBank(offset) {
     if (offset === 0) $("bankList").innerHTML = "";
     if (!rows.length) {
       if (offset === 0) {
-        $("bankList").innerHTML = '<div class="empty">词组库为空<br><small>到「更多」里点「重建词组库」从词典提取</small></div>';
+        $("bankList").innerHTML = '<div class="empty">词组库为空<br><small>MDX 导入时会自动生成；也可在「更多」里手动重建</small></div>';
       }
       $("bankMore").style.display = "none";
       return;

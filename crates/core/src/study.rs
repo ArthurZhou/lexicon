@@ -8,13 +8,16 @@ use crate::Result;
 
 /// Extract every phrase/idiom from all entries into the phrase bank.
 /// Idempotent: clears the bank and rebuilds it.
-pub fn rebuild_phrase_bank(d: &Db) -> Result<usize> {
+/// `progress` is called after every parsed entry with the running count —
+/// used by the CLI to show import progress.
+pub fn rebuild_phrase_bank_with(d: &Db, mut progress: impl FnMut(usize)) -> Result<usize> {
     d.conn().execute_batch("DELETE FROM phrases")?;
     let mut stmt = d.conn().prepare("SELECT headword, definition FROM entries")?;
     let rows = stmt.query_map([], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
     })?;
     let mut n = 0usize;
+    let mut done = 0usize;
     for r in rows {
         let (head, def) = r?;
         let parsed = parse_definition(&head, &def);
@@ -30,8 +33,15 @@ pub fn rebuild_phrase_bank(d: &Db) -> Result<usize> {
             )?;
             n += 1;
         }
+        done += 1;
+        progress(done);
     }
     Ok(n)
+}
+
+/// Same as [`rebuild_phrase_bank_with`] without progress reporting.
+pub fn rebuild_phrase_bank(d: &Db) -> Result<usize> {
+    rebuild_phrase_bank_with(d, |_| {})
 }
 
 /// One parsed wordlist line.

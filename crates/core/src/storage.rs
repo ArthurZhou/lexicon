@@ -566,13 +566,13 @@ impl Db {
     /// New cards (status New) are capped by new_per_day - new_done_today;
     /// due cards are capped by review_per_day - review_done_today.
     /// Returns (cards, new_left, review_left); each card is
-    /// (card_id, headword, card_type, difficulty, phrase).
+    /// (card_id, headword, card_type, difficulty, phrase, is_new).
     pub fn daily_due_queue(
         &self,
         now: &chrono::NaiveDateTime,
         limit: i64,
         wordlist_id: Option<i64>,
-    ) -> Result<(Vec<(i64, String, String, String, String)>, u32, u32)> {
+    ) -> Result<(Vec<(i64, String, String, String, String, bool)>, u32, u32)> {
         let (new_done, review_done) = self.today_progress()?;
         let (new_pd, review_pd) = self.daily_limits()?;
         let new_left = new_pd.saturating_sub(new_done);
@@ -586,7 +586,7 @@ impl Db {
         };
 
         // due cards first (oldest due first), then new cards.
-        let mut out: Vec<(i64, String, String, String, String)> = Vec::new();
+        let mut out: Vec<(i64, String, String, String, String, bool)> = Vec::new();
 
         let review_take = review_left.min(limit as u32);
         if review_take > 0 {
@@ -606,6 +606,7 @@ impl Db {
                         r.get::<_, String>(2)?,
                         r.get::<_, String>(3)?,
                         r.get::<_, String>(4)?,
+                        false,
                     ))
                 },
             )?;
@@ -629,6 +630,7 @@ impl Db {
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
                     r.get::<_, String>(4)?,
+                    true,
                 ))
             })?;
             for r in rows {
@@ -636,6 +638,82 @@ impl Db {
             }
         }
         Ok((out, new_left, review_left))
+    }
+
+    // ---- auto new-word drawing (Shanbay-style) ----
+
+    fn scope_clause(wordlist_id: Option<i64>, alias: &str) -> String {
+        match wordlist_id {
+            Some(0) | None => String::new(),
+            Some(id) => format!(
+                " AND {alias} IN (SELECT headword FROM wordlist_words WHERE wordlist_id = {id})"
+            ),
+        }
+    }
+
+    /// Words in the dictionary (optionally restricted to a wordlist scope)
+    /// that do not have a word card yet — the pool auto-draw draws from.
+    pub fn undrawn_word_count(&self, wordlist_id: Option<i64>) -> Result<usize> {
+        let clause = Self::scope_clause(wordlist_id, "e.headword");
+        let sql = format!(
+            "SELECT COUNT(*) FROM entries e
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM cards c JOIN words cw ON cw.id = c.word_id
+                 WHERE cw.headword = e.headword AND c.card_type = 'word'
+             ){clause}"
+        );
+        let n: i64 = self.conn.query_row(&sql, [], |r| r.get(0))?;
+        Ok(n as usize)
+    }
+
+    /// Pending (not yet graded) new cards in scope.
+    pub fn pending_new_count(&self, wordlist_id: Option<i64>) -> Result<usize> {
+        let clause = Self::scope_clause(wordlist_id, "w.headword");
+        let sql = format!(
+            "SELECT COUNT(*) FROM cards c JOIN words w ON w.id = c.word_id
+             WHERE c.status = 'New'{clause}"
+        );
+        let n: i64 = self.conn.query_row(&sql, [], |r| r.get(0))?;
+        Ok(n as usize)
+    }
+
+    /// Shanbay-style automatic new-word drawing: pick up to `want` random
+    /// dictionary words (optionally restricted to a wordlist scope) that
+    /// have no word card yet and create new cards for them. This is what
+    /// fills the queue when the daily new quota is not exhausted but no
+    /// pending new cards remain. Returns how many cards were created.
+    pub fn auto_draw_new_cards(&self, wordlist_id: Option<i64>, want: u32) -> Result<usize> {
+        if want == 0 {
+            return Ok(0);
+        }
+        let clause = Self::scope_clause(wordlist_id, "e.headword");
+        let sql = format!(
+            "SELECT e.headword FROM entries e
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM cards c JOIN words cw ON cw.id = c.word_id
+                 WHERE cw.headword = e.headword AND c.card_type = 'word'
+             ){clause}
+             ORDER BY RANDOM() LIMIT ?1"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![want as i64], |r| r.get::<_, String>(0))?;
+        let mut created = 0usize;
+        for r in rows {
+            let word = r?;
+            if self.add_new_card(&word)? > 0 {
+                created += 1;
+            }
+        }
+        Ok(created)
+    }
+
+    /// Whether Shanbay-style auto drawing is enabled (setting `auto_new`,
+    /// default on).
+    pub fn auto_new_enabled(&self) -> Result<bool> {
+        Ok(self
+            .get_setting("auto_new")?
+            .map(|v| v != "0" && v != "false")
+            .unwrap_or(true))
     }
 
     // ---- learning records ----
