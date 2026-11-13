@@ -80,8 +80,18 @@ PWA（manifest + service worker + 图标）已内置。把页面“添加到主�
 | 困难 | 首字母 + 字母数 + 中文意思，不给例句 | 词组首字母骨架 + 中文释义 |
 
 - **背单词**：看中文回忆英文，`忘记得多` 自动降档给更多提示，`连续答简单` 自动升档。
+  例句提示会自动挑选能挖空的首个例句（含不规则动词变形），没有可挖空例句时
+  用「例句中文翻译」作提示，不泄露答案。
 - **固定搭配与词组**：`phrases --extract` 从词典提取词组/习语库；查词页可直接
-  把某个词的词组/习语一键加入复习，词组卡与单词卡一起进入 SM2 队列。
+  把某个词的词组/习语一键加入复习，词组卡与单词卡一起进入 SM2 队列。每日
+  新学抽卡会自动混合约 1/4 的词组/习语卡（受当前词表约束）。
+- **词 ↔ 词组关联**：词组库存有 `source_id` 关联到源单词；查词弹窗下方直接
+  列出该词的词组/习语并一键加入学习，复习答案页也会展示关联词组。
+- **考纲词表约束**：「更多 → 导入词表」粘贴上海高中英语考纲词汇表（每行一个
+  单词）即可创建词表并自动设为当前范围，新词抽取/复习队列都只在该范围内
+  进行；也可用命令行 `wordlist` 导入文件。
+- **释义排版**：查词结果按「音标/词性 → 编号释义 → 例句 → 词组/习语」结构化
+  展示，不再是一坨混在一起的纯文本。
 
 ### 5. 命令行
 
@@ -89,7 +99,7 @@ PWA（manifest + service worker + 图标）已内置。把页面“添加到主�
 lexicon-cli lookup oxford.db apple        # 查词（自动解析 @@@LINK= 别名）
 lexicon-cli review oxford.db apple ...    # 交互式复习指定词
 lexicon-cli scope oxford.db wordlist.txt  # 从文件批量加入生词
-lexicon-cli wordlist oxford.db 高考 list.txt --type word   # 建词表（word/phrase/pattern）
+lexicon-cli wordlist oxford.db 上海高中考纲 list.txt --type word   # 建词表（word/phrase/pattern）
 lexicon-cli phrases oxford.db break       # 看某词的词组/习语
 lexicon-cli phrases oxford.db --extract   # 全量提取词组/句式库（约 1.6 万条）
 lexicon-cli config oxford.db --new 20 --review 100   # 每日新学/复习上限
@@ -116,6 +126,7 @@ lexicon-cli stats oxford.db               # 统计
 | POST | /api/phrases/rebuild | 从词典全量重建词组库 |
 | GET/POST | /api/settings | 每日新学/复习上限、当前词表 |
 | GET  | /api/wordlists | 词表列表 |
+| POST | /api/wordlist/import | {name, words} 粘贴导入词表（如考纲词汇）并返回 id |
 | GET  | /api/cards?limit= | 学习记录 |
 | GET  | /manifest.json, /sw.js, /icon.svg | PWA 资源 |
 

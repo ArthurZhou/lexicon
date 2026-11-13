@@ -86,7 +86,9 @@ CREATE TABLE IF NOT EXISTS phrases (
 );
 
 CREATE INDEX IF NOT EXISTS idx_cards_due ON cards(due);
+CREATE INDEX IF NOT EXISTS idx_cards_word ON cards(word_id, card_type);
 CREATE INDEX IF NOT EXISTS idx_entries_headword ON entries(headword);
+CREATE INDEX IF NOT EXISTS idx_phrases_source ON phrases(source);
 CREATE INDEX IF NOT EXISTS idx_review_card ON review_log(card_id);
 CREATE INDEX IF NOT EXISTS idx_review_date ON review_log(reviewed_at);
 "#;
@@ -95,6 +97,19 @@ impl Db {
     pub fn open(path: impl AsRef<Path>) -> Result<Db> {
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
+        // Migration: link every phrase to its source word (word <-> phrase
+        // relation). Older databases get the column added on open; the
+        // backfill only touches rows still missing the link.
+        let _ = conn.execute_batch("ALTER TABLE phrases ADD COLUMN source_id INTEGER");
+        let _ = conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_phrases_source_id ON phrases(source_id)",
+        );
+        let _ = conn.execute(
+            "UPDATE phrases SET source_id = \
+             (SELECT id FROM words WHERE words.headword = phrases.source) \
+             WHERE source_id IS NULL",
+            [],
+        );
         // Keep sort/temp working even where a temp file dir is blocked or slow:
         // RANDOM()-style whole-table sorts (random_word) run in memory. This is
         // also a net win for a small local dictionary.
@@ -423,10 +438,13 @@ impl Db {
     }
 
     /// Reviews done TODAY (local): (new_done, review_done).
+    /// Written as an indexed range over reviewed_at (a date() wrapper would
+    /// force a full table scan on every review request).
     pub fn today_progress(&self) -> Result<(u32, u32)> {
         let mut stmt = self.conn.prepare(
             "SELECT is_new, COUNT(*) FROM review_log
-             WHERE date(reviewed_at) = date('now', 'localtime')
+             WHERE reviewed_at >= date('now', 'localtime')
+               AND reviewed_at < date('now', 'localtime', '+1 day')
              GROUP BY is_new",
         )?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
@@ -533,6 +551,18 @@ impl Db {
             added += n;
         }
         Ok(added)
+    }
+
+    /// How many of a wordlist's headwords exist in the dictionary.
+    pub fn wordlist_match_count(&self, wordlist_id: i64) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM wordlist_words ww
+             JOIN words w ON w.headword = ww.headword
+             WHERE ww.wordlist_id = ?1",
+            params![wordlist_id],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
     }
 
     /// All word lists with their word counts.
@@ -679,13 +709,19 @@ impl Db {
 
     /// Shanbay-style automatic new-word drawing: pick up to `want` random
     /// dictionary words (optionally restricted to a wordlist scope) that
-    /// have no word card yet and create new cards for them. This is what
-    /// fills the queue when the daily new quota is not exhausted but no
-    /// pending new cards remain. Returns how many cards were created.
+    /// have no word card yet and create new cards for them. About a quarter
+    /// of the quota is spent on phrase/idiom cards from the phrase bank (the
+    /// rest when the word pool runs dry), so daily study mixes words with
+    /// their collocations. Returns how many cards were created.
     pub fn auto_draw_new_cards(&self, wordlist_id: Option<i64>, want: u32) -> Result<usize> {
         if want == 0 {
             return Ok(0);
         }
+        let phrase_want: usize =
+            if self.phrase_count().unwrap_or(0) > 0 { (want / 4) as usize } else { 0 };
+        let word_want: usize = want as usize - phrase_want;
+        let mut created = 0usize;
+
         let clause = Self::scope_clause(wordlist_id, "e.headword");
         let sql = format!(
             "SELECT e.headword FROM entries e
@@ -696,11 +732,62 @@ impl Db {
              ORDER BY RANDOM() LIMIT ?1"
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![want as i64], |r| r.get::<_, String>(0))?;
-        let mut created = 0usize;
+        let rows = stmt.query_map(params![word_want as i64], |r| r.get::<_, String>(0))?;
+        let mut words = Vec::new();
         for r in rows {
-            let word = r?;
-            if self.add_new_card(&word)? > 0 {
+            words.push(r?);
+        }
+        drop(stmt);
+        for word in &words {
+            if self.add_new_card(word)? > 0 {
+                created += 1;
+            }
+        }
+
+        // Phrase cards: skip phrases already being studied (same source word
+        // + phrase text). When the word pool was exhausted, take the rest of
+        // the quota from phrases as well.
+        let mut phrase_take = phrase_want;
+        if created < word_want {
+            phrase_take += word_want - created;
+        }
+        if phrase_take > 0 {
+            created += self.auto_draw_phrase_cards(wordlist_id, phrase_take as u32)?;
+        }
+        Ok(created)
+    }
+
+    /// Draw up to `want` phrase cards from the phrase bank (respecting the
+    /// wordlist scope through the phrase's source word).
+    fn auto_draw_phrase_cards(&self, wordlist_id: Option<i64>, want: u32) -> Result<usize> {
+        let scope = match wordlist_id {
+            Some(0) | None => String::new(),
+            Some(id) => format!(
+                " AND p.source IN (SELECT headword FROM wordlist_words WHERE wordlist_id = {id})"
+            ),
+        };
+        let sql = format!(
+            "SELECT p.source, p.text, p.phrase_type FROM phrases p
+             WHERE p.source != '' AND NOT EXISTS (
+                 SELECT 1 FROM cards c JOIN words cw ON cw.id = c.word_id
+                 WHERE cw.headword = p.source AND c.phrase = p.text
+                   AND c.card_type = CASE WHEN p.phrase_type = 'pv' THEN 'phrase' ELSE 'pattern' END
+             ){scope}
+             ORDER BY RANDOM() LIMIT ?1"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![want as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })?;
+        let mut picked = Vec::new();
+        for r in rows {
+            picked.push(r?);
+        }
+        drop(stmt);
+        let mut created = 0usize;
+        for (source, text, ptype) in picked {
+            let ctype = if ptype == "pv" { CardType::Phrase } else { CardType::Pattern };
+            if self.add_new_card_full(&source, ctype, Difficulty::Easy, &source, &text)? > 0 {
                 created += 1;
             }
         }
@@ -765,7 +852,8 @@ impl Db {
 
     // ---- phrase bank ----
 
-    /// Store an extracted phrasal verb / idiom / pattern.
+    /// Store an extracted phrasal verb / idiom / pattern, linked to its
+    /// source word (source_id references words.id).
     pub fn insert_phrase(
         &self,
         source: &str,
@@ -776,10 +864,18 @@ impl Db {
         example_en: &str,
         example_zh: &str,
     ) -> Result<i64> {
+        let source_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM words WHERE headword = ?1",
+                params![source],
+                |r| r.get(0),
+            )
+            .optional()?;
         self.conn.execute(
-            "INSERT OR IGNORE INTO phrases (source, phrase_type, text, def_en, def_zh, example_en, example_zh)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![source, phrase_type, text, def_en, def_zh, example_en, example_zh],
+            "INSERT OR IGNORE INTO phrases (source, source_id, phrase_type, text, def_en, def_zh, example_en, example_zh)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![source, source_id, phrase_type, text, def_en, def_zh, example_en, example_zh],
         )?;
         Ok(self.conn.last_insert_rowid())
     }

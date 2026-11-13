@@ -3,7 +3,7 @@
 //! lexicon-core; HTML/JS/CSS live in the assets/ directory (include_str!).
 
 use lexicon_core::model::Difficulty;
-use lexicon_core::prompt::{build_card_prompt, plainify, resolve_def};
+use lexicon_core::prompt::build_card_prompt;
 use lexicon_core::storage::Db;
 
 const INDEX_HTML: &str = include_str!("../assets/index.html");
@@ -91,7 +91,7 @@ fn handle(d: &Db, req: &mut tiny_http::Request) -> Resp {
         // ---- review queue ----
         (&tiny_http::Method::Get, "/api/due") => {
             let now = lexicon_core::sm2::now();
-            let limit = query_i64(query, "limit").unwrap_or(50);
+            let limit = query_i64(query, "limit").unwrap_or(50).max(1);
             let wl = query_i64(query, "list")
                 .or_else(|| {
                     d.get_setting("active_wordlist")
@@ -100,24 +100,32 @@ fn handle(d: &Db, req: &mut tiny_http::Request) -> Resp {
                         .and_then(|v| v.parse::<i64>().ok())
                 })
                 .or(Some(0));
-            // Shanbay-style top-up: when the daily new quota is not
-            // exhausted but no pending new cards remain, draw new words
-            // (respecting the active wordlist scope) so the queue never
-            // stalls at "task done".
-            let mut auto_drawn = 0usize;
             let auto_new = d.auto_new_enabled().unwrap_or(true);
+            // Keep the hot path cheap (one card = one request from the UI):
+            // a single queue query; the Shanbay-style top-up only runs when
+            // the queue came up short of the daily new quota.
+            let mut res = d.daily_due_queue(&now, limit, wl);
+            let mut auto_drawn = 0usize;
             if auto_new {
-                // Best-effort top-up; failures fall back to the normal queue.
-                if let Ok((_, new_left, _)) = d.daily_due_queue(&now, 0, wl) {
-                    let pending = d.pending_new_count(wl).unwrap_or(0);
-                    let topup = new_left.saturating_sub(pending as u32);
-                    if topup > 0 {
-                        auto_drawn = d.auto_draw_new_cards(wl, topup).unwrap_or(0);
+                if let Ok((cards, new_left, _)) = &res {
+                    if *new_left > 0 && (cards.len() as i64) < limit {
+                        let pending = d.pending_new_count(wl).unwrap_or(0);
+                        let topup = (*new_left).saturating_sub(pending as u32);
+                        if topup > 0 {
+                            auto_drawn = d.auto_draw_new_cards(wl, topup).unwrap_or(0);
+                            if auto_drawn > 0 {
+                                res = d.daily_due_queue(&now, limit, wl);
+                            }
+                        }
                     }
                 }
             }
-            match d.daily_due_queue(&now, limit, wl) {
+            match res {
                 Ok((cards, new_left, review_left)) => {
+                    // undrawn-word count is an expensive scan: only compute
+                    // it when the empty-state message actually needs it
+                    let scope_remaining =
+                        if cards.is_empty() { d.undrawn_word_count(wl).unwrap_or(0) } else { 0 };
                     let arr: Vec<serde_json::Value> = cards
                         .into_iter()
                         .map(|(id, headword, ctype, diff, phrase, is_new)| {
@@ -142,7 +150,7 @@ fn handle(d: &Db, req: &mut tiny_http::Request) -> Resp {
                             "review_left": review_left,
                             "auto_drawn": auto_drawn,
                             "auto_new": auto_new,
-                            "scope_remaining": d.undrawn_word_count(wl).unwrap_or(0),
+                            "scope_remaining": scope_remaining,
                         })
                         .to_string(),
                     )
@@ -268,6 +276,38 @@ fn handle(d: &Db, req: &mut tiny_http::Request) -> Resp {
             Err(e) => json_response(500, format!("{{\"error\": \"{e}\"}}")),
         },
 
+        // Create a word list from a pasted batch of words (e.g. the
+        // Shanghai high-school exam syllabus): {name, words: "a\nb\nc"}
+        (&tiny_http::Method::Post, "/api/wordlist/import") => {
+            with_json_body(req, |v| {
+                let name = v["name"].as_str().unwrap_or("").trim().to_string();
+                let raw = v["words"].as_str().unwrap_or("");
+                let mut words: Vec<String> = Vec::new();
+                for part in
+                    raw.split(|c: char| c == '\n' || c == '\r' || c == ',' || c == '\t' || c == ' ')
+                {
+                    let w = part.trim();
+                    if !w.is_empty() && !words.iter().any(|x| x == w) {
+                        words.push(w.to_string());
+                    }
+                }
+                if name.is_empty() || words.is_empty() {
+                    return json_response(
+                        400,
+                        "{\"ok\":false,\"error\":\"name and words required\"}".into(),
+                    );
+                }
+                match lexicon_core::study::create_wordlist_from_words(d, &name, &words) {
+                    Ok((id, added, matched)) => json_response(
+                        200,
+                        serde_json::json!({"ok": true, "id": id, "added": added, "matched": matched})
+                            .to_string(),
+                    ),
+                    Err(e) => json_response(500, format!("{{\"ok\":false,\"error\":\"{e}\"}}")),
+                }
+            })
+        }
+
         // ---- records ----
         (&tiny_http::Method::Get, "/api/cards") => {
             let limit = query_i64(query, "limit").unwrap_or(200);
@@ -303,8 +343,8 @@ fn handle(d: &Db, req: &mut tiny_http::Request) -> Resp {
                     let arr: Vec<serde_json::Value> = rows
                         .into_iter()
                         .map(|(headword, def)| {
-                            let text = resolve_def(d, &headword, def.as_deref().unwrap_or(""));
-                            serde_json::json!({"headword": headword, "text": plainify(&text)})
+                            let text = lexicon_core::prompt::format_entry(d, &headword, &def.as_deref().unwrap_or(""));
+                            serde_json::json!({"headword": headword, "text": text})
                         })
                         .collect();
                     json_response(200, serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into()))
@@ -317,8 +357,13 @@ fn handle(d: &Db, req: &mut tiny_http::Request) -> Resp {
             match d.lookup_resolved(&w) {
                 Ok(Some(def)) => json_response(
                     200,
-                    serde_json::json!({"headword": w, "text": plainify(&def), "found": true})
-                        .to_string(),
+                    serde_json::json!({
+                        "headword": w,
+                        // structured plain text: numbered senses + examples + phrases
+                        "text": lexicon_core::prompt::format_entry(d, &w, &def),
+                        "found": true
+                    })
+                    .to_string(),
                 ),
                 Ok(None) => json_response(
                     200,

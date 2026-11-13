@@ -195,6 +195,12 @@
   .dialog h3 { margin: 0 0 12px; font-size: 1.05rem; }
   .dialog .close { float: right; background: none; color: var(--muted); font-size: 1.2rem; }
   .def-text { font-size: .92rem; line-height: 1.7; white-space: pre-wrap; word-break: break-word; color: #1e293b; }
+  #wlWords {
+    width: 100%; min-height: 110px; border: 1px solid var(--line); border-radius: 12px;
+    padding: 10px 12px; font-size: .9rem; font-family: inherit; resize: vertical; outline: none;
+    background: #fff; margin-bottom: 10px;
+  }
+  #wlWords:focus { border-color: var(--brand); }
 </style>
 </head>
 <body>
@@ -285,6 +291,13 @@
         <label class="switch"><input type="checkbox" id="setAuto"><span class="track"></span></label>
       </div>
       <button class="ghost big" id="setSave" style="margin-bottom:14px">保存设置</button>
+      <div class="section-title">导入词表（考纲约束）</div>
+      <div class="setting-row">
+        <span class="lbl">词表名称<small>例如：上海高中英语考纲</small></span>
+        <input type="text" id="wlName" style="width:150px;border:1px solid var(--line);border-radius:10px;padding:8px;font-size:.95rem">
+      </div>
+      <textarea id="wlWords" placeholder="粘贴考纲词汇表：每行一个单词（也支持逗号/空格分隔）…"></textarea>
+      <button class="ghost big" id="wlImport" style="margin-bottom:14px">导入并设为当前词表</button>
       <div class="section-title">维护</div>
       <button class="ghost big" id="btnRebuild" style="margin-bottom:14px">重建词组库（从词典提取全部词组）</button>
       <div class="section-title">学习记录</div>
@@ -312,7 +325,8 @@
 <script>
 "use strict";
 var $ = function (id) { return document.getElementById(id); };
-var state = { card: null, list: 0, bankOffset: 0, autoNew: true, scopeRemaining: 0 };
+var state = { card: null, list: 0, bankOffset: 0, autoNew: true, scopeRemaining: 0,
+  limits: { new_per_day: 20, review_per_day: 100 } };
 
 function toast(msg) {
   var t = $("toast");
@@ -350,14 +364,22 @@ function setBar(id, done, lim) {
   el.style.width = pct + "%";
   el.className = pct >= 100 ? "full" : "";
 }
+/* update the quota bars locally (no extra requests per card) */
+function updateProgress(newLeft, reviewLeft) {
+  var l = state.limits;
+  var newDone = Math.max(0, l.new_per_day - (newLeft || 0));
+  var revDone = Math.max(0, l.review_per_day - (reviewLeft || 0));
+  $("pNew").textContent = newDone;
+  $("pNewLim").textContent = "/" + l.new_per_day;
+  $("pRev").textContent = revDone;
+  $("pRevLim").textContent = "/" + l.review_per_day;
+  setBar("barNew", newDone, l.new_per_day);
+  setBar("barRev", revDone, l.review_per_day);
+}
 function loadHeader() {
   api("/api/settings").then(function (s) {
-    $("pNew").textContent = s.new_done;
-    $("pNewLim").textContent = "/" + s.new_per_day;
-    $("pRev").textContent = s.review_done;
-    $("pRevLim").textContent = "/" + s.review_per_day;
-    setBar("barNew", s.new_done, s.new_per_day);
-    setBar("barRev", s.review_done, s.review_per_day);
+    state.limits = { new_per_day: s.new_per_day, review_per_day: s.review_per_day };
+    updateProgress(s.new_per_day - (s.new_done || 0), s.review_per_day - (s.review_done || 0));
     $("setNew").value = s.new_per_day;
     $("setRev").value = s.review_per_day;
     $("setAuto").checked = !!s.auto_new;
@@ -441,10 +463,10 @@ function drawNew(want) {
 function nextCard() {
   api("/api/due?limit=1&list=" + state.list).then(function (r) {
     if (r.auto_drawn > 0) {
-      toast("已自动加入 " + r.auto_drawn + " 个新词");
+      toast("已自动加入 " + r.auto_drawn + " 张新卡（含词组）");
     }
     state.scopeRemaining = r.scope_remaining || 0;
-    loadHeader();
+    updateProgress(r.new_left, r.review_left);
     if (!r.cards || !r.cards.length) {
       // Task done — explain why and offer actions.
       var msg, acts = [];
@@ -497,6 +519,12 @@ function renderCard(c) {
   if (p.extra && p.extra.pos) meta.push(p.extra.pos);
   if (p.extra && p.extra.senses_zh && p.extra.senses_zh.length) meta.push(p.extra.senses_zh.join("；"));
   if (p.extra && p.extra.example) meta.push("例：" + p.extra.example + "\n" + (p.extra.example_zh || ""));
+  // phrases linked to this word in the phrase bank
+  if (p.extra && p.extra.phrases && p.extra.phrases.length) {
+    meta.push("词组：" + p.extra.phrases.map(function (x) {
+      return x.text + (x.def_zh ? "（" + x.def_zh + "）" : "");
+    }).join("；"));
+  }
   $("answerMeta").textContent = meta.join("\n");
   $("answerBox").classList.remove("show");
   $("btnReveal").style.display = "block";
@@ -642,9 +670,26 @@ $("btnRandom").addEventListener("click", function () {
 function showEntry(word) {
   api("/api/lookup?w=" + encodeURIComponent(word)).then(function (r) {
     $("dialogTitle").textContent = word;
-    $("dialogBody").textContent = r.text || "（词典里没有这个词条）";
-    $("dialogBg").classList.add("show");
-    // rebind add button
+    var body = $("dialogBody");
+    body.innerHTML = "";
+    var pre = document.createElement("div");
+    pre.className = "def-text";
+    pre.style.marginBottom = "10px";
+    pre.textContent = r.text || "（词典里没有这个词条）";
+    body.appendChild(pre);
+    // phrases/idioms linked to this word, one-tap add to study
+    api("/api/phrases/for?word=" + encodeURIComponent(word)).then(function (rows) {
+      if (!rows || !rows.length) return;
+      var h = document.createElement("div");
+      h.className = "section-title";
+      h.style.marginTop = "14px";
+      h.textContent = "词组 / 习语（点击加入学习）";
+      body.appendChild(h);
+      rows.slice(0, 12).forEach(function (p) {
+        p.source = word;
+        body.appendChild(phraseRow(p));
+      });
+    });
     var btn = document.createElement("button");
     btn.className = "ghost";
     btn.style.marginTop = "12px";
@@ -659,13 +704,44 @@ function showEntry(word) {
         $("dialogBg").classList.remove("show");
       });
     });
-    $("dialogBody").appendChild(document.createElement("br"));
-    $("dialogBody").appendChild(btn);
+    body.appendChild(btn);
+    $("dialogBg").classList.add("show");
   });
 }
 $("dialogClose").addEventListener("click", function () { $("dialogBg").classList.remove("show"); });
 $("dialogBg").addEventListener("click", function (e) {
   if (e.target === this) this.classList.remove("show");
+});
+
+/* ---- wordlist import (exam syllabus scope) ---- */
+$("wlImport").addEventListener("click", function () {
+  var name = $("wlName").value.trim();
+  var words = $("wlWords").value.trim();
+  if (!name || !words) { toast("请填写词表名称并粘贴单词"); return; }
+  var btn = this;
+  btn.disabled = true;
+  api("/api/wordlist/import", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: name, words: words })
+  }).then(function (r) {
+    btn.disabled = false;
+    if (!r.ok) { toast(r.error || "导入失败"); return; }
+    toast("已导入 " + r.added + " 词（词典中 " + r.matched + " 词）");
+    $("wlName").value = "";
+    $("wlWords").value = "";
+    // activate the new list so新词抽取被约束到考纲范围
+    api("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ active_wordlist: String(r.id) })
+    }).then(function () {
+      state.list = r.id;
+      toast("已切换到「" + name + "」，新词只会从该词表抽取");
+      loadHeader();
+      nextCard();
+    });
+  });
 });
 
 /* ---- more: stats + records ---- */

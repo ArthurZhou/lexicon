@@ -97,6 +97,21 @@ pub fn initial_difficulty() -> Difficulty {
     Difficulty::Easy
 }
 
+/// Create a named word list from a batch of headwords (e.g. a pasted exam
+/// syllabus like the Shanghai high-school gaokao vocabulary). Words missing
+/// from the dictionary are still stored (they simply never match cards).
+/// Returns (wordlist id, inserted count, count found in the dictionary).
+pub fn create_wordlist_from_words(
+    d: &Db,
+    name: &str,
+    words: &[String],
+) -> Result<(i64, usize, usize)> {
+    let id = d.create_wordlist(name)?;
+    let added = d.add_wordlist_words(id, words)?;
+    let matched = d.wordlist_match_count(id)?;
+    Ok((id, added, matched))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

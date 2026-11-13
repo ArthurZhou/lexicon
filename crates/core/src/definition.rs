@@ -27,15 +27,31 @@ pub struct PhraseItem {
     pub example_zh: String,
 }
 
+/// One numbered sense with its own examples.
+#[derive(Debug, Clone, Default)]
+pub struct Sense {
+    /// Sense number as printed in the dictionary ("1", "2", …, may be empty).
+    pub num: String,
+    /// English definition (may be empty for zh-only layouts).
+    pub def_en: String,
+    /// Chinese gloss from <chn>.
+    pub def_zh: String,
+    /// (english example, chinese translation) pairs belonging to this sense.
+    pub examples: Vec<(String, String)>,
+}
+
 /// Structured content for one headword.
 #[derive(Debug, Clone, Default)]
 pub struct Definition {
     pub headword: String,
     pub phonetic: String,
     pub pos: String,
-    /// Chinese senses (from .chn)
+    /// Full ordered senses (English def + Chinese gloss + examples).
+    pub senses: Vec<Sense>,
+    /// Chinese senses (from .chn) — kept for backwards compatibility.
     pub senses_zh: Vec<String>,
-    /// (english example, chinese translation) pairs from .x/.tx
+    /// (english example, chinese translation) pairs from .x/.tx — flattened
+    /// across senses (compat field).
     pub examples: Vec<(String, String)>,
     /// phrasal verbs and idioms found in the definition
     pub phrases: Vec<PhraseItem>,
@@ -126,13 +142,19 @@ pub fn parse_definition(headword: &str, html: &str) -> Definition {
         ..Default::default()
     };
 
-    // ---- tag-based layout (oalecd9) ----
-    def.phonetic = tag_blocks(html, "phon")
+    // phonetics/pos: only from the head part, before the phrase blocks
+    let head_end = ["<pv-g", "<idm-g", "<pv-gs-blk", "<idm-gs-blk"]
+        .iter()
+        .filter_map(|m| html.find(m))
+        .min()
+        .unwrap_or(html.len());
+    let head = &html[..head_end];
+    def.phonetic = tag_blocks(head, "phon")
         .first()
         .map(|s| strip_tags(s))
         .filter(|s| !s.is_empty())
         .unwrap_or_default();
-    def.pos = tag_blocks(html, "pos")
+    def.pos = tag_blocks(head, "pos")
         .first()
         .map(|s| strip_tags(s))
         .filter(|s| !s.is_empty())
@@ -179,28 +201,83 @@ pub fn parse_definition(headword: &str, html: &str) -> Definition {
         }
     }
 
-    // senses + examples: only from the head part, before the phrase blocks,
-    // so phrase senses don't pollute the word prompt
-    let head_end = ["<pv-g", "<idm-g", "<pv-gs-blk", "<idm-gs-blk"]
-        .iter()
-        .filter_map(|m| html.find(m))
-        .min()
-        .unwrap_or(html.len());
-    let head = &html[..head_end];
-    for d in tag_blocks(head, "def") {
-        if let Some(zh) = tag_blocks(&d, "chn").first() {
-            let zh = strip_tags(zh);
-            if !zh.is_empty() {
-                def.senses_zh.push(zh);
+    // senses: parse <sn-g> blocks from the entry with phrase blocks REMOVED.
+    // Cutting the phrase blocks (instead of truncating at the first one)
+    // keeps the senses of later part-of-speech sections (e.g. the noun
+    // senses of "break" that follow its verb phrasal-verb blocks).
+    let cleaned = remove_blocks(html, "pv-gs-blk");
+    let cleaned = remove_blocks(&cleaned, "idm-gs-blk");
+    let cleaned = remove_blocks(&cleaned, "pv-g");
+    let cleaned = remove_blocks(&cleaned, "idm-g");
+    for block in tag_blocks(&cleaned, "sn-g") {
+        let num = tag_blocks(&block, "sn")
+            .first()
+            .map(|s| strip_tags(s).trim().to_string())
+            .unwrap_or_default();
+        let Some(def_el) = tag_blocks(&block, "def").first().cloned() else { continue };
+        let def_zh = tag_blocks(&def_el, "chn")
+            .first()
+            .map(|s| strip_tags(s))
+            .unwrap_or_default();
+        let def_en = {
+            let mut e = def_el.clone();
+            if let Some(c) = tag_blocks(&def_el, "chn").first() {
+                e = e.replace(&format!("<chn>{c}</chn>"), "");
+            }
+            strip_tags(&e)
+        };
+        let mut examples = Vec::new();
+        for x in tag_blocks(&block, "x").into_iter().take(4) {
+            let (en, zh) = split_example(&x);
+            if !en.is_empty() {
+                examples.push((en, zh));
+            }
+        }
+        if !def_zh.is_empty() || !def_en.is_empty() {
+            def.senses.push(Sense {
+                num,
+                def_en: def_en.trim().trim_start_matches(';').trim().to_string(),
+                def_zh: def_zh.trim().to_string(),
+                examples,
+            });
+        }
+    }
+    // fallback: bare <def> blocks without <sn-g> wrappers
+    if def.senses.is_empty() {
+        for d_el in tag_blocks(&cleaned, "def").into_iter().take(20) {
+            let def_zh = tag_blocks(&d_el, "chn")
+                .first()
+                .map(|s| strip_tags(s))
+                .unwrap_or_default();
+            let def_en = {
+                let mut e = d_el.clone();
+                if let Some(c) = tag_blocks(&d_el, "chn").first() {
+                    e = e.replace(&format!("<chn>{c}</chn>"), "");
+                }
+                strip_tags(&e)
+            };
+            if !def_zh.is_empty() || !def_en.is_empty() {
+                def.senses.push(Sense {
+                    num: String::new(),
+                    def_en: def_en.trim().to_string(),
+                    def_zh: def_zh.trim().to_string(),
+                    examples: Vec::new(),
+                });
             }
         }
     }
-    for x in tag_blocks(head, "x").into_iter().take(12) {
-        let (en, zh) = split_example(&x);
-        if !en.is_empty() {
-            def.examples.push((en, zh));
-        }
-    }
+    def.senses_zh = def
+        .senses
+        .iter()
+        .filter(|s| !s.def_zh.is_empty())
+        .map(|s| s.def_zh.clone())
+        .collect();
+    def.examples = def
+        .senses
+        .iter()
+        .flat_map(|s| s.examples.iter().cloned())
+        .take(12)
+        .collect();
 
     // ---- class-based fallback (oalecd8) ----
     if def.phonetic.is_empty() {
@@ -219,16 +296,6 @@ pub fn parse_definition(headword: &str, html: &str) -> Definition {
             }
         }
     }
-    if def.examples.is_empty() {
-        def.examples = extract_examples(html);
-    }
-    if def.phrases.is_empty() {
-        for kind in ["pv", "id", "sd"] {
-            extract_phrase_blocks(html, kind, &mut def.phrases);
-        }
-    }
-    def
-}
 
 /// Split `<x>` content into (english, chinese translation): the English part
 /// is everything minus the inner `<chn>…</chn>`, the Chinese part is that
@@ -244,6 +311,50 @@ fn split_example(x_html: &str) -> (String, String) {
         en = en.replace(&full, "");
     }
     (strip_tags(&en).trim().to_string(), zh)
+}
+
+    if def.examples.is_empty() {
+        def.examples = extract_examples(html);
+    }
+    if def.phrases.is_empty() {
+        for kind in ["pv", "id", "sd"] {
+            extract_phrase_blocks(html, kind, &mut def.phrases);
+        }
+    }
+    def
+}
+
+/// Remove every `<tag …>…</tag>` block from `html` (same matching rules as
+/// [`tag_blocks`]). Used to strip phrase sections before sense extraction so
+/// senses of later part-of-speech sections survive.
+fn remove_blocks(html: &str, tag: &str) -> String {
+    let open = format!("<{}", tag);
+    let close = format!("</{}>", tag);
+    let is_word_boundary =
+        |c: u8| c == b'>' || c == b' ' || c == b'\t' || c == b'\n' || c == b'\r';
+    let mut out = String::with_capacity(html.len());
+    let mut from = 0usize;
+    while let Some(rel) = html[from..].find(&open) {
+        let start = from + rel;
+        match html.as_bytes().get(start + open.len()) {
+            Some(&c) if is_word_boundary(c) => {}
+            // false positive (e.g. <pv-gs-blk> while removing pv-g):
+            // keep the text and keep scanning after the prefix
+            _ => {
+                out.push_str(&html[from..start + open.len()]);
+                from = start + open.len();
+                continue;
+            }
+        }
+        // keep the text before the block, then skip to after its close tag
+        out.push_str(&html[from..start]);
+        match html[start..].find(&close) {
+            Some(rel2) => from = start + rel2 + close.len(),
+            None => return out, // unterminated block: drop the rest
+        }
+    }
+    out.push_str(&html[from..]);
+    out
 }
 
 /// Contents of every `<tag …>…</tag>` block (non-greedy, no nested same-tag
@@ -342,6 +453,24 @@ pub fn has_phrases(html: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keeps_senses_after_phrase_blocks() {
+        // noun senses that follow the verb's pv-gs-blk must survive
+        let html = concat!(
+            r#"<subentry-g><pos-g><pos>verb</pos></pos-g>"#,
+            r#"<sn-gs><sn-g><sn-blk><sn>1</sn></sn-blk><def>to damage<chn>打破</chn></def></sn-g></sn-gs>"#,
+            r#"<pv-gs-blk><pv-gs><pv-g><pv>ˌbreak aˈway</pv><sn-gs><sn-g><def>to escape<chn>挣脱</chn></def></sn-g></sn-gs></pv-g></pv-gs></pv-gs-blk>"#,
+            r#"</subentry-g><subentry-g><pos-g><pos>noun</pos></pos-g>"#,
+            r#"<sn-gs><sn-g><sn-blk><sn>1</sn></sn-blk><def>a rest from work<chn>休息</chn></def></sn-g></sn-gs></subentry-g>"#,
+        );
+        let d = parse_definition("break", html);
+        let zh: Vec<_> = d.senses.iter().map(|s| s.def_zh.as_str()).collect();
+        assert_eq!(zh, vec!["打破", "休息"]);
+        assert_eq!(d.senses[0].num, "1");
+        assert_eq!(d.senses[0].def_en, "to damage");
+        assert_eq!(d.phrases.len(), 1);
+    }
 
     #[test]
     fn parses_apple_definition() {

@@ -107,33 +107,67 @@ pub fn build_card_prompt(
             } else {
                 parsed.senses_zh[..parsed.senses_zh.len().min(2)].join("；")
             };
-            let (ex_en, ex_zh) = parsed
-                .examples
-                .first()
-                .map(|(e, z)| (e.clone(), z.clone()))
-                .unwrap_or_default();
-            let masked =
-                if ex_en.is_empty() { String::new() } else { cloze_example(&ex_en, headword) };
-            // Hard style (also the fallback when no example is available):
-            // first letter + letter count + Chinese meaning, no example.
+            // Examples: senses first (per-sense extraction), then the
+            // aggregate fallback.
+            let mut exs: Vec<(String, String)> =
+                parsed.senses.iter().flat_map(|s| s.examples.clone()).collect();
+            if exs.is_empty() {
+                exs = parsed.examples.clone();
+            }
+            // Prefer the first example the word can actually be clozed out
+            // of (earlier senses often use an inflected/derived form that
+            // cannot be masked, while a later one works).
+            let mut masked = String::new();
+            let mut ex_en = String::new();
+            let mut ex_zh = String::new();
+            for (e, z) in &exs {
+                let m = cloze_example(e, headword);
+                if !m.is_empty() {
+                    masked = m;
+                    ex_en = e.clone();
+                    ex_zh = z.clone();
+                    break;
+                }
+            }
+            if ex_en.is_empty() && !exs.is_empty() {
+                // no maskable example: still surface the first one in the
+                // answer view and use its translation as a hint (a Chinese
+                // translation never leaks the English answer)
+                ex_en = exs[0].0.clone();
+                ex_zh = exs[0].1.clone();
+            }
+            let ex_hint =
+                if ex_zh.is_empty() { String::new() } else { format!("例句翻译：{ex_zh}") };
+            // Hard style (first letter + letter count + Chinese meaning):
+            // the fallback when no example can be shown safely.
             let hard_question = format!("{}  {}", first_letter_mask(headword), zh);
             let (question, hint) = match diff {
                 "hard" => (hard_question, String::new()),
                 "medium" => {
                     if masked.is_empty() {
-                        (hard_question, String::new())
+                        (hard_question, ex_hint)
                     } else {
-                        (masked.clone(), format!("例句翻译：{ex_zh}"))
+                        (masked.clone(), ex_hint)
                     }
                 }
                 _ => {
                     if masked.is_empty() {
-                        (hard_question, String::new())
+                        (hard_question, ex_hint)
                     } else {
-                        (masked, format!("词义：{zh}\n例句翻译：{ex_zh}"))
+                        (masked, format!("词义：{zh}\n{ex_hint}"))
                     }
                 }
             };
+            // Phrases/idioms linked to this word in the phrase bank.
+            let related: Vec<serde_json::Value> = d
+                .phrases_for(headword)
+                .unwrap_or_default()
+                .into_iter()
+                .take(5)
+                .map(|(_, pt, text, _, dz, _, _)| {
+                    serde_json::json!({"text": text, "def_zh": dz, "kind": pt})
+                })
+                .collect();
             serde_json::json!({
                 "kind": "word",
                 "question": question,
@@ -146,6 +180,7 @@ pub fn build_card_prompt(
                     "example": ex_en,
                     "example_zh": ex_zh,
                     "difficulty": diff,
+                    "phrases": related,
                 }
             })
         }
@@ -430,6 +465,87 @@ pub fn norm_phrase(s: &str) -> String {
         .to_lowercase()
 }
 
+/// Render a dictionary entry as clean, structured plain text for the
+/// lookup view: phonetics + part of speech, numbered senses with Chinese
+/// glosses and examples, then phrasal verbs / idioms sections.
+/// Much easier to read than raw plainify output ("a blob of everything").
+pub fn format_entry(d: &Db, headword: &str, def: &str) -> String {
+    let def = resolve_def(d, headword, def);
+    if def.trim().is_empty() {
+        return String::new();
+    }
+    let parsed = parse_definition(headword, &def);
+    let mut out: Vec<String> = Vec::new();
+
+    let mut head = String::new();
+    if !parsed.phonetic.is_empty() {
+        head.push_str(&format!("/{} /", parsed.phonetic.trim_matches('/')));
+    }
+    if !parsed.pos.is_empty() {
+        if !head.is_empty() {
+            head.push_str("  ");
+        }
+        head.push_str(&parsed.pos);
+    }
+    if !head.is_empty() {
+        out.push(head);
+    }
+
+    let max_senses = 12usize;
+    let shown = parsed.senses.len().min(max_senses);
+    for (i, s) in parsed.senses.iter().take(shown).enumerate() {
+        let num = if s.num.is_empty() { format!("{}", i + 1) } else { s.num.clone() };
+        let en = s.def_en.trim();
+        let zh = s.def_zh.trim();
+        let mut line = format!("{num}. ");
+        if !en.is_empty() {
+            line.push_str(en);
+            if !zh.is_empty() {
+                line.push_str("  ");
+            }
+        }
+        line.push_str(zh);
+        out.push(line);
+        for (e, z) in s.examples.iter().take(2) {
+            out.push(format!("   {e}"));
+            if !z.is_empty() {
+                out.push(format!("      {z}"));
+            }
+        }
+    }
+    if parsed.senses.len() > shown {
+        out.push(format!("…（还有 {} 条释义，用命令行查看）", parsed.senses.len() - shown));
+    }
+
+    for (label, kind) in [("词组", "pv"), ("习语", "id"), ("谚语", "sd")] {
+        let items: Vec<_> = parsed.phrases.iter().filter(|p| p.kind == kind).collect();
+        if items.is_empty() {
+            continue;
+        }
+        out.push(String::new());
+        out.push(format!("【{label}】"));
+        for p in items.iter().take(10) {
+            let zh = if p.def_zh.trim().is_empty() { p.def_en.trim() } else { p.def_zh.trim() };
+            out.push(format!("{}  {}", p.text, zh));
+            if !p.example_en.is_empty() {
+                out.push(format!("   {}", p.example_en));
+                if !p.example_zh.is_empty() {
+                    out.push(format!("      {}", p.example_zh));
+                }
+            }
+        }
+        if items.len() > 10 {
+            out.push(format!("…（还有 {} 条）", items.len() - 10));
+        }
+    }
+
+    if out.is_empty() {
+        // nothing structured found: fall back to plainified raw text
+        return plainify(&def);
+    }
+    out.join("\n")
+}
+
 /// Convert an MDX definition (HTML with markup, styles and media links)
 /// into readable plain text. This is what kills the "raw source code" look:
 /// scripts, styles, images, audio and sound:// refs are dropped, block
@@ -456,6 +572,17 @@ pub fn plainify(html: &str) -> String {
     // <br> becomes a newline
     let re_br = regex::Regex::new(r"(?i)<br\s*/?>").unwrap();
     s = re_br.replace_all(&s, "\n").to_string();
+
+    // OALECD9 dictionary block elements start a new line (the MDX markup
+    // has almost no <div>/<p>; without this the entry is one giant blob)
+    let re_blk = regex::Regex::new(
+        r#"(?i)<(?:subentry-g|top-g|pos-g|pos-blk|sn-gs|sn-g|sn-blk|x-gs|x-g-blk|\
+           pv-gs-blk|pv-gs|pv-g-blk|pv-g|pv-blk|pvp-g-blk|pvp-g|idm-gs-blk|idm-gs|\
+           idm-g-blk|idm-g|idm-blk|id-g|dis-g|shcut-blk|shcut|gram-g|gram-blk|\
+           unbox|boxblock|xr-gs|xr-g|ul|ol|li|p|div|tr|table|dl|dt|dd)\b[^>]*>"#,
+    )
+    .unwrap();
+    s = re_blk.replace_all(&s, "\n").to_string();
 
     // block containers become newlines
     let re_close = regex::Regex::new(
